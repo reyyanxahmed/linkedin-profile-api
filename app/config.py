@@ -11,7 +11,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 @dataclass
@@ -22,8 +23,10 @@ class SessionConfig:
     jsessionid: str
 
 
-class Settings(BaseModel):
+class Settings(BaseSettings):
     """All runtime config. Defaults match .env.example and BUILD_SPEC.md section 3."""
+
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     api_key: str = Field(default="", alias="API_KEY")
     li_sessions_raw: str = Field(default="", alias="LI_SESSIONS")
