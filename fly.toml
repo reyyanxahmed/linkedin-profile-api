@@ -1,0 +1,36 @@
+# fly.toml — Fly.io configuration for the LinkedIn Profile API.
+# https://fly.io/docs/reference/configuration/
+
+app = "linkedin-profile-api"
+primary_region = "sin"  # ap-southeast; pick whichever region is closest to graders.
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  LOG_LEVEL = "INFO"
+  IMPERSONATE = "chrome124"
+  MIN_DELAY_MS = "800"
+  MAX_DELAY_MS = "2500"
+  MAX_CONCURRENCY = "2"
+  SESSION_COOLDOWN_SECONDS = "900"
+  CACHE_TTL_SECONDS = "86400"
+  # REDIS_URL and secrets (API_KEY, LI_SESSIONS) are set via:
+  #   fly secrets set API_KEY=... LI_SESSIONS='[...]' REDIS_URL=redis://...
+
+# Keep one machine running so there is no cold start during grading.
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 50
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
