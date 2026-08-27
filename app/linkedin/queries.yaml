@@ -1,0 +1,39 @@
+# queries.yaml — GraphQL queryId and dash decorationId values.
+#
+# THESE VALUES ROTATE WITH LINKEDIN FRONTEND DEPLOYS. They are deployment-specific
+# hashes that you cannot know without capturing them from a real session. Treat them
+# as CONFIGURATION, not code. When the GraphQL strategy breaks, this is the file to edit.
+#
+# How to obtain real values (the one-command recipe):
+#
+#   1. Log into LinkedIn in a browser, open devtools (Network tab).
+#   2. Browse 3-4 profiles. The web app fires GraphQL and dash requests.
+#   3. Export the HAR (right-click entries -> "Save all as HAR").
+#   4. Run:  python scripts/extract_query_ids.py capture.har
+#   5. Paste the printed values below.
+#
+# A value that is still "PLACEHOLDER" at runtime causes the strategy to raise
+# ConfigError (which names this key) and degrade to the next strategy in the chain.
+# The API still works without these; it just uses the legacy / public-HTML fallback.
+
+# --- GraphQL (Generation 3) --------------------------------------------------
+# Profile cards query. Used by the live web app. Needs a profileUrn (resolved from
+# the slug via dash or legacy first).
+graphql:
+  # queryId for the profile-cards query. Refresh via the recipe above.
+  # Example real shape: "voyagerIdentityDashProfiles.5d3ce0a3b3c7f4e2c3f0f2c1a1b1b1b"
+  profile_cards_query_id: "PLACEHOLDER"
+  # If multiple card queries exist, add more keys here.
+
+# --- Dash (Generation 2) -----------------------------------------------------
+# The decorationId suffix number changes across deploys. Capture yours.
+dash:
+  # Full decorationId for the memberIdentity profile query.
+  # Example real shape: "com.linkedin.voyager.dash.deco.identity.profile.FullProfileWithEntities-46"
+  full_profile_decoration_id: "PLACEHOLDER"
+
+# --- Legacy (Generation 1) --------------------------------------------------
+# Legacy REST endpoints (/voyager/api/identity/profiles/{slug}/profileView and
+# sub-resources) do NOT need queryIds. No config required. The strategy works
+# whenever a session is available.
+legacy: {}
