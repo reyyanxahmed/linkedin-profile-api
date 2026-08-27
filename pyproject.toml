@@ -1,0 +1,56 @@
+[project]
+name = "linkedin-profile-api"
+version = "0.1.0"
+description = "HTTP API that returns a LinkedIn profile as structured JSON by hitting Voyager endpoints directly."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "Reyyan" }]
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]",
+    "curl_cffi>=0.7",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "redis>=5.0",
+    "selectolax",
+    "structlog",
+    "orjson",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff",
+    "httpx",            # for TestClient against FastAPI
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
+markers = [
+    "offline: tests that never touch the network (default for all)",
+    "needs_fixture: requires a recorded fixture on disk; skipped when absent",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "RUF"]
+ignore = ["E501"]  # line length handled by formatter if used
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
