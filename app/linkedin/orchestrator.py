@@ -17,7 +17,6 @@ import structlog
 import yaml
 
 from app.config import Settings
-from app.errors import ConfigError
 from app.linkedin.client import LinkedInClient
 from app.linkedin.strategies import FetchResult, Strategy
 from app.linkedin.strategies.dash import DashStrategy
@@ -107,67 +106,59 @@ class Orchestrator:
         result = OrchestratorResult()
         primary: FetchResult | None = None
         primary_strategy: Strategy | None = None
+        supplemented: list[str] = []
 
-        # Phase 1: try the flagship-web RSC strategy first (LinkedIn's current transport).
-        # If it succeeds, we're done — no need to hit deprecated Voyager endpoints.
+        # Phase 1: try the flagship-web RSC strategy for the profile header
+        # (name, headline, location, photos, followers) and experience.
+        flagship_result: FetchResult | None = None
         for strat in self.strategies:
             if isinstance(strat, FlagshipWebStrategy):
                 try:
                     r = await strat.fetch(slug, client)
-                except ConfigError as e:
-                    log.warning("strategy.config_error", strategy=strat.name, error=str(e))
                 except Exception as e:
                     log.warning("strategy.error", strategy=strat.name, error=str(e))
                 if r and r.payload is not None:
-                    primary = r
-                    primary_strategy = strat
+                    flagship_result = r
                 break
 
-        # Phase 2: if flagship didn't work, try Voyager strategies as fallback.
-        if not primary:
-            profile_urn: str | None = None
-            for strat in self.strategies:
-                if isinstance(strat, (FlagshipWebStrategy, GraphQLStrategy)):
-                    continue
-                if not strat.requires_auth:
-                    continue
+        # Phase 2: try the Voyager REST strategy for structured data
+        # (experience positions, skills, education, languages, certifications).
+        # This is the universal approach — works for any profile.
+        voyager_result: FetchResult | None = None
+        for strat in self.strategies:
+            if isinstance(strat, LegacyStrategy):
                 try:
                     r = await strat.fetch(slug, client)
-                except ConfigError as e:
-                    log.warning("strategy.config_error", strategy=strat.name, error=str(e))
-                    continue
                 except Exception as e:
                     log.warning("strategy.error", strategy=strat.name, error=str(e))
-                    continue
                 if r and r.payload is not None:
-                    if not primary:
-                        primary = r
-                        primary_strategy = strat
-                    if r.profile_urn and not profile_urn:
-                        profile_urn = r.profile_urn
+                    voyager_result = r
+                break
 
-            # Try GraphQL with resolved URN.
-            if profile_urn:
-                for strat in self.strategies:
-                    if not isinstance(strat, GraphQLStrategy):
-                        continue
-                    try:
-                        r = await strat.fetch(slug, client, profile_urn=profile_urn)
-                    except ConfigError as e:
-                        log.warning("strategy.config_error", strategy=strat.name, error=str(e))
-                        continue
-                    except Exception as e:
-                        log.warning("strategy.error", strategy=strat.name, error=str(e))
-                        continue
-                    if r and r.payload is not None:
-                        primary = r
-                        primary_strategy = strat
-                        break
-
-        # Phase 3: public HTML fallback (unauthenticated).
-        if not primary:
+        # Phase 3: merge — prefer Voyager for structured data, flagship for header.
+        if voyager_result and flagship_result:
+            # Both worked: use Voyager as primary (it has the full normalized
+            # envelope), and supplement the profile header from flagship.
+            primary = voyager_result
+            primary_strategy = next(s for s in self.strategies if isinstance(s, LegacyStrategy))
+            supplemented.append("flagship_web_rsc")
+            # Merge flagship's main_texts into the payload for header fields
+            # that Voyager may not have (photos, followers, about).
+            if isinstance(primary.payload, dict):
+                primary.payload["_flagship_main_texts"] = flagship_result.payload.get("main_texts", [])
+                primary.payload["_flagship_about_texts"] = flagship_result.payload.get("about_texts", [])
+        elif voyager_result:
+            primary = voyager_result
+            primary_strategy = next(s for s in self.strategies if isinstance(s, LegacyStrategy))
+        elif flagship_result:
+            primary = flagship_result
+            primary_strategy = next(s for s in self.strategies if isinstance(s, FlagshipWebStrategy))
+        else:
+            # Phase 4: try GraphQL and public HTML as last resorts.
             for strat in self.strategies:
-                if strat.requires_auth:
+                if isinstance(strat, (FlagshipWebStrategy, LegacyStrategy)):
+                    continue
+                if not strat.requires_auth:
                     continue
                 try:
                     r = await strat.fetch(slug, client)
@@ -179,11 +170,25 @@ class Orchestrator:
                     primary_strategy = strat
                     break
 
+            if not primary:
+                for strat in self.strategies:
+                    if strat.requires_auth:
+                        continue
+                    try:
+                        r = await strat.fetch(slug, client)
+                    except Exception as e:
+                        log.warning("strategy.error", strategy=strat.name, error=str(e))
+                        continue
+                    if r and r.payload is not None:
+                        primary = r
+                        primary_strategy = strat
+                        break
+
         if not primary or not primary_strategy:
             log.info("orchestrator.no_strategy_succeeded", slug=slug)
             return result
 
         result.sections = {"_primary": primary.payload, "_source": primary.source}
-        result.profile_urn = primary.profile_urn or profile_urn
+        result.profile_urn = primary.profile_urn
         result.source = primary.source
         return result

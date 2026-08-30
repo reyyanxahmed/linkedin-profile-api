@@ -307,7 +307,6 @@ async def _fetch_profile(raw_url: str, refresh: bool, request: Request) -> Profi
         lang_texts = primary.get("language_texts", [])
         about_texts = primary.get("about_texts", [])
 
-        # Profile mapper takes both main_texts and about_texts for the about section
         try:
             profile = map_profile_from_rsc(main_texts, about_texts)
         except Exception as e:
@@ -339,6 +338,26 @@ async def _fetch_profile(raw_url: str, refresh: bool, request: Request) -> Profi
         honors = _safe_map_list("honors", map_honors, graph, partial)
         volunteer = _safe_map_list("volunteer", map_volunteer, graph, partial)
         courses = _safe_map_list("courses", map_courses, graph, partial)
+
+        # Supplement profile header from flagship texts if available.
+        # Voyager gives us structured experience/education/skills/etc., but
+        # may lack photos, followers, and about text that the flagship has.
+        flagship_texts = primary.get("_flagship_main_texts", []) if isinstance(primary, dict) else []
+        if flagship_texts and not profile.images.profile:
+            from app.linkedin.strategies.flagship_web import (
+                map_profile_from_rsc,
+            )
+            rsc_profile = map_profile_from_rsc(flagship_texts)
+            if rsc_profile.images.profile and not profile.images.profile:
+                profile.images = rsc_profile.images
+            if rsc_profile.counts.followers and not profile.counts.followers:
+                profile.counts.followers = rsc_profile.counts.followers
+            if rsc_profile.headline and not profile.headline:
+                profile.headline = rsc_profile.headline
+            if rsc_profile.about and not profile.about:
+                profile.about = rsc_profile.about
+            if rsc_profile.location and rsc_profile.location.raw and not profile.location:
+                profile.location = rsc_profile.location
 
     completeness = compute_completeness(profile, experience, education, skills)
 
