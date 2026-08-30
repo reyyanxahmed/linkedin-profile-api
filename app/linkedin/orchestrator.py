@@ -108,43 +108,31 @@ class Orchestrator:
         primary: FetchResult | None = None
         primary_strategy: Strategy | None = None
 
-        # Phase 1: find the primary. GraphQL needs a URN, so resolve it first via
-        # dash or legacy. We attempt GraphQL last (after URN resolution) but record
-        # it as highest priority in the chain.
-        profile_urn: str | None = None
-        # First, try dash/legacy purely to resolve the URN (cheap; one call each).
+        # Phase 1: try the flagship-web RSC strategy first (LinkedIn's current transport).
+        # If it succeeds, we're done — no need to hit deprecated Voyager endpoints.
         for strat in self.strategies:
-            if not strat.requires_auth and strat.name == "public_html":
-                continue
-            if isinstance(strat, GraphQLStrategy):
-                continue  # GraphQL handled after URN resolution
-            try:
-                if isinstance(strat, DashStrategy):
+            if isinstance(strat, FlagshipWebStrategy):
+                try:
                     r = await strat.fetch(slug, client)
-                elif isinstance(strat, LegacyStrategy):
-                    r = await strat.fetch(slug, client)
-                else:
-                    r = await strat.fetch(slug, client)
-            except ConfigError as e:
-                log.warning("strategy.config_error", strategy=strat.name, error=str(e))
-                continue
-            except Exception as e:
-                log.warning("strategy.error", strategy=strat.name, error=str(e))
-                continue
-            if r and r.payload is not None:
-                if not primary:
+                except ConfigError as e:
+                    log.warning("strategy.config_error", strategy=strat.name, error=str(e))
+                except Exception as e:
+                    log.warning("strategy.error", strategy=strat.name, error=str(e))
+                if r and r.payload is not None:
                     primary = r
                     primary_strategy = strat
-                if r.profile_urn and not profile_urn:
-                    profile_urn = r.profile_urn
+                break
 
-        # Now attempt GraphQL with the resolved URN (if we have one).
-        if profile_urn:
+        # Phase 2: if flagship didn't work, try Voyager strategies as fallback.
+        if not primary:
+            profile_urn: str | None = None
             for strat in self.strategies:
-                if not isinstance(strat, GraphQLStrategy):
+                if isinstance(strat, (FlagshipWebStrategy, GraphQLStrategy)):
+                    continue
+                if not strat.requires_auth:
                     continue
                 try:
-                    r = await strat.fetch(slug, client, profile_urn=profile_urn)
+                    r = await strat.fetch(slug, client)
                 except ConfigError as e:
                     log.warning("strategy.config_error", strategy=strat.name, error=str(e))
                     continue
@@ -152,12 +140,31 @@ class Orchestrator:
                     log.warning("strategy.error", strategy=strat.name, error=str(e))
                     continue
                 if r and r.payload is not None:
-                    # GraphQL is highest priority; it becomes the primary.
-                    primary = r
-                    primary_strategy = strat
-                    break
+                    if not primary:
+                        primary = r
+                        primary_strategy = strat
+                    if r.profile_urn and not profile_urn:
+                        profile_urn = r.profile_urn
 
-        # If no authenticated strategy produced a payload, try the public fallback.
+            # Try GraphQL with resolved URN.
+            if profile_urn:
+                for strat in self.strategies:
+                    if not isinstance(strat, GraphQLStrategy):
+                        continue
+                    try:
+                        r = await strat.fetch(slug, client, profile_urn=profile_urn)
+                    except ConfigError as e:
+                        log.warning("strategy.config_error", strategy=strat.name, error=str(e))
+                        continue
+                    except Exception as e:
+                        log.warning("strategy.error", strategy=strat.name, error=str(e))
+                        continue
+                    if r and r.payload is not None:
+                        primary = r
+                        primary_strategy = strat
+                        break
+
+        # Phase 3: public HTML fallback (unauthenticated).
         if not primary:
             for strat in self.strategies:
                 if strat.requires_auth:

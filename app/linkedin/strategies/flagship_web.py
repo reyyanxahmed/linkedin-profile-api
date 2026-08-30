@@ -109,27 +109,63 @@ class FlagshipWebStrategy:
         )
 
     async def _fetch_live(self, slug: str, client: Any) -> FetchResult | None:
-        """Fetch from LinkedIn's live RSC endpoints."""
-        # 1. Main profile page
-        main_url = f"{FLAGSHIP_BASE}/in/{up.quote(slug)}/"
-        main_texts = await _fetch_and_extract(client, main_url)
-        if not main_texts:
+        """Fetch from LinkedIn's live RSC endpoints.
+
+        The flagship-web endpoints need the x-li-rsc-stream header to return RSC
+        wire format instead of HTML. The main page is a GET; the component endpoints
+        (experience, languages) are POSTs with a JSON body containing the slug and
+        profile URN.
+        """
+        try:
+            session = client.pool.acquire()
+        except Exception as e:
+            log.warning("flagship.no_session", error=str(e))
             return None
 
-        # 2. Experience section
+        headers = _build_browser_headers(session)
+
+        # 1. Main profile page — GET with skipRedirect=true
+        main_url = f"{FLAGSHIP_BASE}/in/{up.quote(slug)}/?skipRedirect=true"
+        main_texts = await _fetch_rsc_url(client, main_url, headers, method="GET")
+        if not main_texts:
+            client.pool.report_failure(session, hard=True)
+            return None
+
+        client.pool.report_success(session)
+
+        # Extract the profile URN from the main page texts.
+        profile_urn = _extract_profile_urn(main_texts)
+
+        # 2. Experience section — POST to the component endpoint.
+        # If the POST fails (LinkedIn's RSC protocol is strict), fall back to
+        # parsing the experience from the main page texts, which contain the
+        # topcard summary ("Company · School") and sometimes position titles.
+        exp_body = _build_component_body(slug, profile_urn)
         exp_url = (
             f"{FLAGSHIP_BASE}/rsc-action/actions/component"
             f"?componentId=com.linkedin.sdui.generated.profile.dsl.impl.profileCardsExperienceOnly"
             f"&sduiid=com.linkedin.sdui.generated.profile.dsl.impl.profileCardsExperienceOnly"
         )
-        exp_texts = await _fetch_and_extract(client, exp_url)
+        exp_texts = await _fetch_rsc_url(client, exp_url, headers, method="POST", body=exp_body)
 
-        # 3. Languages section (optional, may be empty)
+        # 3. Languages section — POST
         lang_url = (
             f"{FLAGSHIP_BASE}/rsc-action/actions/component"
             f"?componentId=com.linkedin.sdui.generated.profile.dsl.impl.profileCardsBelowActivityPart4"
+            f"&sduiid=com.linkedin.sdui.generated.profile.dsl.impl.profileCardsBelowActivityPart4"
         )
-        lang_texts = await _fetch_and_extract(client, lang_url)
+        lang_texts = await _fetch_rsc_url(client, lang_url, headers, method="POST", body=exp_body)
+
+        # 4. If component POSTs failed, try the public HTML page for more data.
+        # The standard /in/{slug}/ URL returns HTML with JSON-LD that has
+        # name, headline, and sometimes experience/education.
+        if not exp_texts:
+            log.info("flagship.component_post_failed_trying_html", slug=slug)
+            html_url = f"https://www.linkedin.com/in/{up.quote(slug)}/"
+            html_texts = await _fetch_rsc_url(client, html_url, headers, method="GET")
+            if html_texts:
+                # Merge any experience-relevant texts from the HTML page.
+                exp_texts = html_texts
 
         payload = {
             "_source": "flagship_web_rsc",
@@ -138,34 +174,145 @@ class FlagshipWebStrategy:
             "language_texts": lang_texts or [],
         }
 
-        # Extract profile URN from main texts
-        profile_urn = _extract_profile_urn(main_texts)
-
         return FetchResult(payload=payload, profile_urn=profile_urn, source=self.name)
 
 
-async def _fetch_and_extract(client: Any, url: str) -> list[str] | None:
-    """Fetch a URL via the client and extract text from the RSC response.
+def _build_browser_headers(session: Any) -> dict[str, str]:
+    """Build headers for flagship-web RSC requests.
 
-    The flagship-web strategy needs cookies but uses the same curl_cffi transport.
-    We call client.fetch (which acquires a session) and then parse the body.
+    The critical header is `x-li-rsc-stream: true` — that's what tells LinkedIn to
+    return the RSC wire format (application/octet-stream) instead of the full HTML
+    page. Without it, you get HTML back regardless of the accept header.
+
+    Also needs:
+      - csrf-token: the JSESSIONID value (quotes stripped, same as Voyager)
+      - accept: */*
+      - sec-fetch-mode: cors, sec-fetch-dest: empty (client-side fetch, not page load)
+    """
+    return {
+        "cookie": f'li_at={session.li_at}; JSESSIONID="{session.jsessionid}"',
+        "user-agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "csrf-token": session.jsessionid,
+        "referer": "https://www.linkedin.com/in/",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "x-li-rsc-stream": "true",
+        "x-li-track": '{"clientVersion":"0.2.7003","osName":"web","timezoneOffset":5.5}',
+    }
+
+
+def _build_component_body(slug: str, profile_urn: str | None) -> bytes:
+    """Build the POST body for an RSC component request.
+
+    Uses the exact body structure from the captured HAR, with the slug and URN
+    templated in. The profileComponentState binding keys include the slug in their
+    names — LinkedIn's server validates the full structure.
+    """
+    import orjson as _orjson
+
+    # Build the full profileComponentState with all binding keys the HAR showed.
+    # Each binding follows the same pattern with the slug in the key name.
+    binding_keys = [
+        ("shouldRefreshScreenOnReappear", "ShouldRefreshScreen"),
+        ("shouldFetchFromCache", "FetchFromCache"),
+        ("shouldDisplayTabAnchors", "ShouldDisplayTabAnchors"),
+        ("shouldReloadTopCardOnReappear", "ShouldReloadTopCardOnReappear"),
+        ("deferredTopCardReloadProfileId", "DeferredTopCardReloadProfileId"),
+        ("shouldDisplayStickyHeader", "ShouldDisplayStickyHeader"),
+        ("shouldRefreshLanguageDetailScreen", "ShouldRefreshLanguageDetailScreen"),
+        ("shouldFocusOnReappear", "ShouldFocusOnReappear"),
+        ("shouldFocusFeaturedOnReappear", "ShouldFocusFeaturedOnReappear"),
+        ("shouldHideProfileCards", "ShouldHideProfileCards"),
+    ]
+    pcs: dict = {"profileId": slug}
+    for field_name, key_suffix in binding_keys:
+        pcs[field_name] = {
+            "type": "com.linkedin.sdui.components.core.BindingImpl",
+            "value": {
+                "key": f"ProfileComponentState{key_suffix}{slug}ProfileComponentState",
+                "namespace": "MemoryNamespace",
+            },
+        }
+    # Fields without bindings
+    pcs["lastPerformedActionRef"] = None
+    pcs["lastFeaturedActionRef"] = None
+
+    body = {
+        "clientArguments": {
+            "payload": {
+                "isSelfView": False,
+                "vanityName": slug,
+                "replaceableSectionArgs": {
+                    "vanityName": slug,
+                    "hideCardsForGoldenGate": False,
+                    "shouldSetupReplaceableComponent": True,
+                    "vieweeProfileId": profile_urn or "",
+                    "isSelfView": False,
+                    "isSelfViewResolved": False,
+                },
+                "profileComponentState": pcs,
+            }
+        }
+    }
+    return _orjson.dumps(body)
+
+
+async def _fetch_rsc_url(
+    client: Any,
+    url: str,
+    headers: dict[str, str],
+    method: str = "GET",
+    body: bytes | None = None,
+) -> list[str] | None:
+    """Fetch a URL via curl_cffi with browser headers and extract RSC text.
+
+    Supports both GET (main page) and POST (component endpoints) requests.
     """
     try:
-        resp = await client.fetch(url)
+        client._ensure()
+
+        if client._http is None:
+            from curl_cffi.requests import AsyncSession
+
+            client._http = AsyncSession(impersonate=client.settings.impersonate)
+
+        import asyncio
+        delay = __import__("random").uniform(
+            client.settings.min_delay_ms / 1000.0,
+            client.settings.max_delay_ms / 1000.0,
+        )
+        await asyncio.sleep(delay)
+
+        async with client._sem:
+            if method == "POST" and body is not None:
+                post_headers = dict(headers)
+                post_headers["content-type"] = "application/json"
+                resp = await client._http.post(url, headers=post_headers, content=body, allow_redirects=True)
+            else:
+                resp = await client._http.get(url, headers=headers, allow_redirects=True)
     except Exception as e:
         log.warning("flagship.fetch_error", url=url[:100], error=str(e))
         return None
 
-    if resp.outcome.value != "ok":
-        log.warning("flagship.non_ok", url=url[:100], outcome=resp.outcome.value)
+    body_resp = getattr(resp, "content", b"") or b""
+    if not body_resp:
         return None
 
-    body = resp.body_bytes
-    if not body:
+    ct = ""
+    raw_headers = dict(getattr(resp, "headers", {}) or {})
+    ct = raw_headers.get("content-type") or raw_headers.get("Content-Type") or ""
+    status = getattr(resp, "status_code", 0)
+    body_str = body_resp.decode("utf-8", errors="replace")
+    if "text/html" in ct.lower() or body_str.startswith("<!DOCTYPE") or body_str.startswith("<html"):
+        log.warning("flagship.auth_wall", url=url[:80], content_type=ct[:50], status=status, body_preview=body_str[:80])
         return None
 
-    # The body may be base64-encoded RSC, or HTML, or plain text.
-    body_str = body.decode("utf-8", errors="replace")
     texts = extract_text(body_str)
     return texts if texts else None
 
