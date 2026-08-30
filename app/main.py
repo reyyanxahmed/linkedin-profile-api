@@ -18,7 +18,6 @@ No browser anywhere in the runtime.
 from __future__ import annotations
 
 import hmac
-import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -319,7 +318,7 @@ async def _fetch_profile(raw_url: str, refresh: bool, request: Request) -> Profi
     )
 
     # Write to cache (best effort).
-    await cache.set(slug, orjson.dumps(response.model_dump()).encode())
+    await cache.set(slug, orjson.dumps(response.model_dump()))
 
     log.info("profile.fetched",
              slug=slug,
@@ -380,6 +379,6 @@ def _decode_cached(blob: bytes, slug: str, rid: str, *, stale: bool = False) -> 
     """Reconstruct a ProfileResponse from a cache blob."""
     data = orjson.loads(blob)
     resp = ProfileResponse.model_validate(data)
-    resp.meta.cache = CacheMeta(hit=True, age_seconds=int(time.time() - 0), stale=stale)
+    resp.meta.cache = CacheMeta(hit=True, age_seconds=0, stale=stale)
     resp.meta.request_id = rid
     return resp

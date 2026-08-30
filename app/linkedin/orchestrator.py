@@ -58,12 +58,15 @@ def load_queries(path: str = "app/linkedin/queries.yaml") -> dict:
         return {}
 
 
-def build_strategies(queries: dict) -> list[Strategy]:
+def build_strategies(queries: dict, offline_mode: bool = False, fixture_dir: str = "") -> list[Strategy]:
     """Construct the strategy chain from queries.yaml values.
 
     The flagship-web RSC strategy is the primary path (LinkedIn migrated to this
     transport). Voyager strategies (GraphQL, dash, legacy) are kept as fallbacks
     in case RSC is unavailable or returns partial data.
+
+    In offline_mode with fixture_dir set, the FlagshipWebStrategy serves from saved
+    RSC fixtures on disk instead of hitting LinkedIn — no network needed.
 
     Strategies with placeholder config still get constructed; they raise ConfigError
     at fetch time (caught by the orchestrator) and degrade to the next strategy.
@@ -71,7 +74,7 @@ def build_strategies(queries: dict) -> list[Strategy]:
     graphql_cfg = queries.get("graphql", {}) or {}
     dash_cfg = queries.get("dash", {}) or {}
     return [
-        FlagshipWebStrategy(),  # primary — LinkedIn's current transport
+        FlagshipWebStrategy(offline_mode=offline_mode, fixture_dir=fixture_dir),
         GraphQLStrategy(graphql_cfg.get("profile_cards_query_id", "")),
         DashStrategy(dash_cfg.get("full_profile_decoration_id", "")),
         LegacyStrategy(),
@@ -94,7 +97,11 @@ class Orchestrator:
     def __init__(self, settings: Settings, queries_path: str = "app/linkedin/queries.yaml") -> None:
         self.settings = settings
         self.queries = load_queries(queries_path)
-        self.strategies = build_strategies(self.queries)
+        self.strategies = build_strategies(
+            self.queries,
+            offline_mode=settings.offline_mode,
+            fixture_dir=settings.fixture_dir,
+        )
 
     async def fetch(self, slug: str, client: LinkedInClient) -> OrchestratorResult:
         result = OrchestratorResult()

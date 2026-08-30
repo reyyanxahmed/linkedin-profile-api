@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     session_cooldown_seconds: int = Field(default=900, alias="SESSION_COOLDOWN_SECONDS")
     http_proxy_url: str = Field(default="", alias="HTTP_PROXY_URL")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    offline_mode: bool = Field(default=False, alias="OFFLINE_MODE")
+    fixture_dir: str = Field(default="", alias="FIXTURE_DIR")
 
     @field_validator("li_sessions_raw")
     @classmethod

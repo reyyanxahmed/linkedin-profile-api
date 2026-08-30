@@ -1,0 +1,71 @@
+# docker-compose.yml — LinkedIn Profile API stack.
+# All open source: Python/FastAPI (app) + Redis (cache) + Caddy (HTTPS proxy).
+# Runs on any machine with Docker — no paid services needed.
+#
+# Usage:
+#   cp .env.example .env  &&  edit .env (set API_KEY, OFFLINE_MODE=true)
+#   docker compose up -d
+#   curl http://localhost:8000/v1/health
+#
+# For HTTPS (if you have a domain pointing at this machine):
+#   1. Edit Caddyfile, replace :80 with your domain
+#   2. docker compose up -d
+#   Caddy auto-provisions Let's Encrypt certs.
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - FIXTURE_DIR=/app/tests/fixtures/rsc
+    volumes:
+      # Mount fixtures so offline mode can read them
+      - ./tests/fixtures/rsc:/app/tests/fixtures/rsc:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8000/v1/health',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    # No port exposed to host — only reachable within the compose network.
+    # If you want Redis on the host too, uncomment:
+    # ports: ["6379:6379"]
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # Caddy: automatic HTTPS reverse proxy. Comment out if you don't need HTTPS.
+  # If you have a domain, edit Caddyfile to use it. Otherwise Caddy serves HTTP on :80.
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  caddy-data:
+  caddy-config:

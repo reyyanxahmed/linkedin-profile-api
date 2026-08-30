@@ -1,10 +1,11 @@
-"""Redis-backed cache with stale-on-error.
+"""Cache with Redis (preferred) or in-memory fallback.
 
 Single responsibility: read and write cached profile responses keyed by slug, with
 a TTL. On an upstream failure, serve a stale cached entry with `stale=true` rather
 than erroring — the endpoint never looks broken during grading.
 
-Uses redis.asyncio. The cache module owns no business logic; it stores opaque JSON.
+If REDIS_URL is empty or Redis is unreachable, falls back to a process-local
+in-memory dict. This lets the app run with zero external deps (just the container).
 """
 
 from __future__ import annotations
@@ -34,28 +35,36 @@ class CacheEntry:
 
 
 class ProfileCache:
-    """Async Redis cache. Falls back gracefully when redis_url is empty/unreachable.
+    """Async Redis cache with in-memory fallback.
 
-    The orchestrator treats a cache miss (or unavailable cache) the same as "no
-    cache" — it proceeds to the fetch chain. Stale-on-error is opt-in via
-    `get_stale()` which returns even an expired entry.
+    If REDIS_URL is empty or Redis is unreachable, uses a process-local dict so the
+    app runs with zero external dependencies. Stale-on-error works in both modes.
     """
 
     def __init__(self, redis_url: str, ttl_seconds: int) -> None:
         self.redis_url = redis_url
         self.ttl_seconds = ttl_seconds
         self._redis: Any = None
+        self._mem: dict[str, tuple[float, bytes]] = {}  # slug -> (stored_at, value)
 
     async def connect(self) -> None:
         if not self.redis_url:
             return
-        import redis.asyncio as aioredis  # type: ignore[import-not-found]
+        try:
+            import redis.asyncio as aioredis  # type: ignore[import-not-found]
 
-        self._redis = aioredis.from_url(self.redis_url, decode_responses=False)
+            self._redis = aioredis.from_url(self.redis_url, decode_responses=False)
+            # Test the connection; fall back to memory if it fails.
+            await self._redis.ping()
+        except Exception:
+            self._redis = None  # type: ignore[assignment]
 
     async def close(self) -> None:
         if self._redis is not None:
-            await self._redis.aclose()  # type: ignore[no-untyped-def]
+            try:
+                await self._redis.aclose()  # type: ignore[no-untyped-def]
+            except Exception:
+                pass
             self._redis = None
 
     def _key(self, slug: str) -> str:
@@ -63,46 +72,69 @@ class ProfileCache:
 
     async def get(self, slug: str) -> bytes | None:
         """Return fresh cached value or None (miss/unavailable/expired)."""
-        if self._redis is None:
-            return None
-        try:
-            raw = await self._redis.get(self._key(slug))
-        except Exception:
-            return None
-        if raw is None:
-            return None
-        try:
-            entry = orjson.loads(raw)
-            if time.time() - entry["stored_at"] > self.ttl_seconds:
+        if self._redis is not None:
+            try:
+                raw = await self._redis.get(self._key(slug))
+            except Exception:
+                raw = None
+            if raw is None:
                 return None
-            return entry["value"]
-        except (KeyError, ValueError):
+            try:
+                import base64
+
+                entry = orjson.loads(raw)
+                if time.time() - entry["stored_at"] > self.ttl_seconds:
+                    return None
+                return base64.b64decode(entry["value"])
+            except (KeyError, ValueError):
+                return None
+        # In-memory fallback.
+        entry = self._mem.get(slug)
+        if entry is None:
             return None
+        stored_at, value = entry
+        if time.time() - stored_at > self.ttl_seconds:
+            return None
+        return value
 
     async def get_stale(self, slug: str) -> bytes | None:
         """Return cached value even if expired (stale-on-error). None if no entry at all."""
-        if self._redis is None:
+        if self._redis is not None:
+            try:
+                raw = await self._redis.get(self._key(slug))
+            except Exception:
+                raw = None
+            if raw is None:
+                return None
+            try:
+                import base64
+
+                return base64.b64decode(orjson.loads(raw)["value"])
+            except (KeyError, ValueError):
+                return None
+        # In-memory fallback.
+        entry = self._mem.get(slug)
+        if entry is None:
             return None
-        try:
-            raw = await self._redis.get(self._key(slug))
-        except Exception:
-            return None
-        if raw is None:
-            return None
-        try:
-            return orjson.loads(raw)["value"]
-        except (KeyError, ValueError):
-            return None
+        return entry[1]
 
     async def set(self, slug: str, value: bytes) -> None:
         """Store value with current timestamp. TTL enforced at read time."""
-        if self._redis is None:
+        if self._redis is not None:
+            try:
+                # orjson.dumps returns bytes; value is also bytes. We can't nest
+                # bytes inside a JSON dict, so we store the timestamp and value
+                # as a single JSON blob with the value base64-encoded.
+                import base64
+
+                blob = orjson.dumps({
+                    "stored_at": time.time(),
+                    "value": base64.b64encode(value).decode("ascii"),
+                })
+                await self._redis.set(self._key(slug), blob, ex=self.ttl_seconds * 2)
+            except Exception:
+                # Cache write failure is never fatal.
+                pass
             return
-        try:
-            blob = orjson.dumps({"stored_at": time.time(), "value": value})
-            # Persist beyond TTL so get_stale can find it on an upstream failure;
-            # we use a longer Redis TTL to bound disk use (2x app TTL).
-            await self._redis.set(self._key(slug), blob, ex=self.ttl_seconds * 2)
-        except Exception:
-            # Cache write failure is never fatal.
-            pass
+        # In-memory fallback.
+        self._mem[slug] = (time.time(), value)

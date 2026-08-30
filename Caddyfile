@@ -1,0 +1,12 @@
+# Caddyfile — reverse proxy with automatic HTTPS.
+#
+# By default, serves HTTP on port 80 (no domain needed).
+# If you have a domain pointing at this machine, replace :80 with your domain:
+#   example.com {
+#       reverse_proxy app:8000
+#   }
+# Caddy will auto-provision a Let's Encrypt certificate.
+
+:80 {
+	reverse_proxy app:8000
+}
