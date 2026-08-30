@@ -91,8 +91,7 @@ class FlagshipWebStrategy:
         """Serve from saved RSC fixtures on disk. No network."""
         fixture_path = self.fixture_dir / f"profile_{slug}.json"
         if not fixture_path.exists():
-            # Try the generic fixtures we captured (jasveen-kaur-kainth)
-            # by mapping the slug to the fixture name.
+            # Try the generic fixtures we captured by mapping the slug to the fixture name.
             for candidate in [self.fixture_dir / f"profile_{slug}.json"]:
                 if candidate.exists():
                     fixture_path = candidate
@@ -415,24 +414,25 @@ def _extract_profile_urn(texts: list[str]) -> str | None:
 def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
     """Map experience positions from the experience section RSC text list.
 
-    The texts are in document order. Each position block follows this pattern:
-      <company_name>
-      <total_duration_at_company>   ("1 yr 8 mos")
-      <location>                    ("Gurugram, Haryana, India")
-      <title>                       ("Analyst")
-      <employment_type>             ("Full-time" / "Internship")
-      <date_range>                  ("Jul 2025 - Present · 1 yr 2 mos")
-      <location_type>               ("On-site" / "Hybrid" / "Remote")
+    The texts are in document order. The date_range is the anchor — we find it
+    with a regex and walk backwards to get the company and title.
 
-    The date_range is the anchor. We walk forwards from each date_range to get
-    location_type, and walk backwards to get title, employment_type, location,
-    and company name.
+    LinkedIn uses two text orderings observed in captures:
+      Layout A: company, duration, location, title, emp_type, date
+      Layout B: title, company, date
+
+    Both share the invariant that the date is the anchor, and the two texts
+    immediately before it are (company, title) in some order. We heuristically
+    detect which is which: if one of them is a known employment type, it's the
+    emp_type (Layout A); otherwise the one closer to the date is the company
+    (Layout B) and the one further is the title (Layout A: reversed).
     """
     DATE_RE = re.compile(
         r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}\s*[-\u2013]\s*"
         r"(?:Present|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})"
         r"(?:\s*[·•]\s*(\d+\s+yr[s]?\s+\d+\s+mos?|\d+\s+mos?|\d+\s+yr[s]?))?"
     )
+    YEAR_RANGE_RE = re.compile(r"^\d{4}\s*[-\u2013]\s*\d{4}$")
     DURATION_RE = re.compile(r"^(\d+\s+yr[s]?\s+\d+\s+mos?|\d+\s+mos?|\d+\s+yr[s]?)$")
     EMPLOYMENT_TYPES = {"Full-time", "Part-time", "Internship", "Contract", "Freelance", "Self-employed"}
     LOCATION_TYPES = {"On-site", "Hybrid", "Remote"}
@@ -444,6 +444,11 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
     while i < len(texts):
         t = texts[i]
         date_match = DATE_RE.match(t)
+        if not date_match:
+            # Also match year-only ranges: "1997 \u2013 2004"
+            year_match = YEAR_RANGE_RE.match(t)
+            if year_match:
+                date_match = year_match
         if date_match:
             title = None
             company_name = None
@@ -452,53 +457,58 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
             location_type = None
             date_str = t
 
-            # Walk backwards: immediately before the date is employment_type,
-            # before that is the title, before that may be location, before
-            # that is the company name (with duration in between).
+            # Walk backwards from the date. The texts before it are, in reverse
+            # order: either [company, title, ...] (Layout B) or
+            # [emp_type, title, location, duration, company, ...] (Layout A).
             j = i - 1
-            # employment_type — but check for "Company · Type" composite first
-            composite_handled = False
+
+            # First, check for the "Company · Type" composite (e.g. "BDO · Internship").
             if j >= 0 and " · " in (texts[j] or ""):
-                # "BDO · Internship" — company · employment_type composite
                 parts = texts[j].split(" · ")
                 if len(parts) == 2 and parts[1] in EMPLOYMENT_TYPES:
                     company_name = parts[0].strip()
                     employment_type = parts[1].strip()
-                    composite_handled = True
                     j -= 1
-            if not composite_handled:
-                # employment_type alone
+                    if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
+                        title = texts[j]
+                        j -= 1
+            else:
+                # The text immediately before the date is either:
+                # - the company name (Layout B: title, company, date)
+                # - the employment_type (Layout A: ..., title, emp_type, date)
                 if j >= 0 and texts[j] in EMPLOYMENT_TYPES:
+                    # Layout A: emp_type, then title, then maybe location, then company
                     employment_type = texts[j]
                     j -= 1
-                # title
-                if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
-                    title = texts[j]
-                    j -= 1
-                # location (optional) — stop if we hit a date or location_type from prev block
-                if j >= 0 and LOCATION_RE.match(texts[j] or ""):
-                    location = texts[j]
-                    j -= 1
-                # Skip duration-only and skills lines
-                while j >= 0 and (DURATION_RE.match(texts[j] or "") or SKILLS_RE.match(texts[j] or "")):
-                    j -= 1
-                # company name — stop at dates and location_types
-                if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
-                    candidate = texts[j]
-                    if candidate and not candidate.endswith(" logo") and not candidate.startswith("http"):
-                        company_name = candidate
-            else:
-                # Composite was handled; the title is before the composite
-                if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
-                    title = texts[j]
-                    j -= 1
+                    if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
+                        title = texts[j]
+                        j -= 1
+                    if j >= 0 and LOCATION_RE.match(texts[j] or ""):
+                        location = texts[j]
+                        j -= 1
+                    while j >= 0 and (DURATION_RE.match(texts[j] or "") or SKILLS_RE.match(texts[j] or "")):
+                        j -= 1
+                    if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
+                        candidate = texts[j]
+                        if candidate and not candidate.endswith(" logo") and not candidate.startswith("http"):
+                            company_name = candidate
+                else:
+                    # Layout B: title, company, date
+                    # texts[j] = company, texts[j-1] = title
+                    if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
+                        company_name = texts[j]
+                        j -= 1
+                    if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
+                        candidate = texts[j]
+                        if candidate and not candidate.endswith(" logo") and not candidate.startswith("http"):
+                            title = candidate
 
             # Walk forwards: location_type may follow the date
             k = i + 1
             if k < len(texts) and texts[k] in LOCATION_TYPES:
                 location_type = texts[k]
 
-            # If location not found backwards, check the forward "City · LocationType" pattern
+            # If location not found backwards, check "City · LocationType" pattern
             if not location and k < len(texts):
                 nxt = texts[k] if k < len(texts) else ""
                 if nxt and " · " in nxt:
