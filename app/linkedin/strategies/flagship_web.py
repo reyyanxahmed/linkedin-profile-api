@@ -198,12 +198,14 @@ def _build_browser_headers(session: Any) -> dict[str, str]:
         "accept": "*/*",
         "accept-language": "en-US,en;q=0.9",
         "csrf-token": session.jsessionid,
+        "origin": "https://www.linkedin.com",
         "referer": "https://www.linkedin.com/in/",
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
         "x-li-rsc-stream": "true",
-        "x-li-track": '{"clientVersion":"0.2.7003","osName":"web","timezoneOffset":5.5}',
+        "x-li-anchor-page-key": "d_flagship3_profile_view_base",
+        "x-li-track": '{"clientVersion":"0.2.7003","mpVersion":"0.2.7003","osName":"web","timezoneOffset":5.5,"timezone":"Asia/Calcutta","deviceFormFactor":"DESKTOP","mpName":"d_flagship3"}',
     }
 
 
@@ -211,13 +213,15 @@ def _build_component_body(slug: str, profile_urn: str | None) -> bytes:
     """Build the POST body for an RSC component request.
 
     Uses the exact body structure from the captured HAR, with the slug and URN
-    templated in. The profileComponentState binding keys include the slug in their
-    names — LinkedIn's server validates the full structure.
+    templated in. The key fields beyond what we had before:
+      - clientArguments.states: [] (empty array, not omitted)
+      - clientArguments.requestMetadata: type tag
+      - clientArguments.screenId: the profile screen ID
+      - clientArguments.knownTemplateIds: [] (empty array)
+      - lastPerformedActionRef and lastFeaturedActionRef are BindingImpl (not null)
     """
     import orjson as _orjson
 
-    # Build the full profileComponentState with all binding keys the HAR showed.
-    # Each binding follows the same pattern with the slug in the key name.
     binding_keys = [
         ("shouldRefreshScreenOnReappear", "ShouldRefreshScreen"),
         ("shouldFetchFromCache", "FetchFromCache"),
@@ -225,10 +229,12 @@ def _build_component_body(slug: str, profile_urn: str | None) -> bytes:
         ("shouldReloadTopCardOnReappear", "ShouldReloadTopCardOnReappear"),
         ("deferredTopCardReloadProfileId", "DeferredTopCardReloadProfileId"),
         ("shouldDisplayStickyHeader", "ShouldDisplayStickyHeader"),
-        ("shouldRefreshLanguageDetailScreen", "ShouldRefreshLanguageDetailScreen"),
+        ("shouldRefreshLanguageDetailScreen", "ShouldRefreshLanguageDetails"),
+        ("lastPerformedActionRef", "LastPerformedActionRef"),
         ("shouldFocusOnReappear", "ShouldFocusOnReappear"),
         ("shouldFocusFeaturedOnReappear", "ShouldFocusFeaturedOnReappear"),
-        ("shouldHideProfileCards", "ShouldHideProfileCards"),
+        ("lastFeaturedActionRef", "LastFeaturedActionRef"),
+        ("shouldHideProfileCards", "ProfileHideCards"),
     ]
     pcs: dict = {"profileId": slug}
     for field_name, key_suffix in binding_keys:
@@ -239,9 +245,6 @@ def _build_component_body(slug: str, profile_urn: str | None) -> bytes:
                 "namespace": "MemoryNamespace",
             },
         }
-    # Fields without bindings
-    pcs["lastPerformedActionRef"] = None
-    pcs["lastFeaturedActionRef"] = None
 
     body = {
         "clientArguments": {
@@ -257,7 +260,13 @@ def _build_component_body(slug: str, profile_urn: str | None) -> bytes:
                     "isSelfViewResolved": False,
                 },
                 "profileComponentState": pcs,
-            }
+            },
+            "states": [],
+            "requestMetadata": {
+                "$type": "proto.sdui.common.RequestMetadata",
+            },
+            "screenId": "com.linkedin.sdui.flagshipnav.profile.Profile",
+            "knownTemplateIds": [],
         }
     }
     return _orjson.dumps(body)
