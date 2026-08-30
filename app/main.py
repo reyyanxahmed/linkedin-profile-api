@@ -249,20 +249,45 @@ async def _fetch_profile(raw_url: str, refresh: bool, request: Request) -> Profi
 
     # Map sections, each in its own try/except (Gate 3: one bad mapper never 500s).
     primary = result.sections.get("_primary", {})
-    graph = UrnGraph(primary if isinstance(primary, dict) else {})
     partial: list[str] = []
 
-    profile = _safe_map("profile", map_profile, graph, partial)
-    experience = _safe_map_list("experience", map_experience, graph, partial)
-    education = _safe_map_list("education", map_education, graph, partial)
-    skills = _safe_map_list("skills", map_skills, graph, partial)
-    certifications = _safe_map_list("certifications", map_certifications, graph, partial)
-    languages = _safe_map_list("languages", map_languages, graph, partial)
-    projects = _safe_map_list("projects", map_projects, graph, partial)
-    publications = _safe_map_list("publications", map_publications, graph, partial)
-    honors = _safe_map_list("honors", map_honors, graph, partial)
-    volunteer = _safe_map_list("volunteer", map_volunteer, graph, partial)
-    courses = _safe_map_list("courses", map_courses, graph, partial)
+    if result.source == "flagship_web_rsc" and isinstance(primary, dict):
+        # Flagship-web RSC payload: text lists, not normalized envelope.
+        from app.linkedin.strategies.flagship_web import (
+            map_education_from_rsc,
+            map_experience_from_rsc,
+            map_languages_from_rsc,
+            map_profile_from_rsc,
+        )
+        main_texts = primary.get("main_texts", [])
+        exp_texts = primary.get("experience_texts", [])
+        lang_texts = primary.get("language_texts", [])
+
+        profile = _safe_map_rsc("profile", map_profile_from_rsc, main_texts, partial)
+        experience = _safe_map_list_rsc("experience", map_experience_from_rsc, exp_texts, partial)
+        education = _safe_map_list_rsc("education", map_education_from_rsc, main_texts, partial)
+        skills: list = []
+        certifications: list = []
+        languages = _safe_map_list_rsc("languages", map_languages_from_rsc, lang_texts, partial)
+        projects: list = []
+        publications: list = []
+        honors: list = []
+        volunteer: list = []
+        courses: list = []
+    else:
+        # Voyager normalized-envelope payload: use UrnGraph mappers.
+        graph = UrnGraph(primary if isinstance(primary, dict) else {})
+        profile = _safe_map("profile", map_profile, graph, partial)
+        experience = _safe_map_list("experience", map_experience, graph, partial)
+        education = _safe_map_list("education", map_education, graph, partial)
+        skills = _safe_map_list("skills", map_skills, graph, partial)
+        certifications = _safe_map_list("certifications", map_certifications, graph, partial)
+        languages = _safe_map_list("languages", map_languages, graph, partial)
+        projects = _safe_map_list("projects", map_projects, graph, partial)
+        publications = _safe_map_list("publications", map_publications, graph, partial)
+        honors = _safe_map_list("honors", map_honors, graph, partial)
+        volunteer = _safe_map_list("volunteer", map_volunteer, graph, partial)
+        courses = _safe_map_list("courses", map_courses, graph, partial)
 
     completeness = compute_completeness(profile, experience, education, skills)
 
@@ -322,6 +347,29 @@ def _safe_map_list(name: str, fn, graph: UrnGraph, partial: list[str]) -> list: 
     log = get_logger("app.mapper")
     try:
         return fn(graph)
+    except Exception as e:
+        log.warning("mapper.failed", section=name, error=str(e))
+        partial.append(name)
+        return []
+
+
+def _safe_map_rsc(name: str, fn, texts: list[str], partial: list[str]):  # type: ignore[no-untyped-def]
+    """Run an RSC single-mapper. On exception, log + return empty Profile; record in partial."""
+    log = get_logger("app.mapper")
+    try:
+        return fn(texts)
+    except Exception as e:
+        log.warning("mapper.failed", section=name, error=str(e))
+        partial.append(name)
+        from app.models import Profile
+        return Profile()
+
+
+def _safe_map_list_rsc(name: str, fn, texts: list[str], partial: list[str]) -> list:  # type: ignore[no-untyped-def]
+    """Run an RSC list-mapper. On exception, log + return []; record in partial."""
+    log = get_logger("app.mapper")
+    try:
+        return fn(texts)
     except Exception as e:
         log.warning("mapper.failed", section=name, error=str(e))
         partial.append(name)

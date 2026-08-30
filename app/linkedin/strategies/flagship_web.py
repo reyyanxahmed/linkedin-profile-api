@@ -1,0 +1,460 @@
+"""Flagship-web RSC strategy for LinkedIn's current transport.
+
+Hits the flagship-web RSC (React Server Components) endpoints that the live LinkedIn
+web app uses. This is NOT a browser — it's direct HTTP against the RSC action endpoints,
+parsing the base64-encoded SDUI (Server-Driven UI) wire format.
+
+LinkedIn migrated profile rendering from Voyager REST/GraphQL to flagship-web RSC.
+The old endpoints (legacy profileView, dash, GraphQL cards) are either deprecated or
+empty in current traffic. This strategy is the primary path; the Voyager strategies
+are kept as fallbacks in case RSC changes or is unavailable.
+
+The strategy fetches two endpoints per profile:
+  1. GET /flagship-web/in/{slug}/ — the main page RSC stream (name, headline, education,
+     photos, profile URN)
+  2. GET /flagship-web/rsc-action/actions/component?componentId=...profileCardsExperienceOnly
+     — the experience section RSC stream (positions, companies, dates, locations)
+
+Both are parsed by app.linkedin.rsc_parser into flat text lists, then the mapper
+functions in this module pattern-match the text into structured profile data.
+
+No browser. No Selenium. No Playwright. Just HTTP + base64 decode + JSON walk.
+"""
+
+from __future__ import annotations
+
+import re
+import urllib.parse as up
+from typing import Any, ClassVar
+
+import structlog
+
+from app.linkedin.rsc_parser import extract_text
+from app.linkedin.strategies import FetchResult
+from app.models import (
+    CompanyRef,
+    Counts,
+    DatePart,
+    Education,
+    Experience,
+    Image,
+    Language,
+    Location,
+    Profile,
+    ProfileFlags,
+    ProfileImages,
+)
+from app.normalize.images import parse_image_expiry
+
+log = structlog.get_logger("strategy.flagship_web")
+
+FLAGSHIP_BASE = "https://www.linkedin.com/flagship-web"
+
+
+class FlagshipWebStrategy:
+    """Hits flagship-web RSC endpoints. Requires auth (cookies). No queryId needed."""
+
+    name: ClassVar[str] = "flagship_web_rsc"
+    requires_auth: ClassVar[bool] = True
+    provides: ClassVar[set[str]] = {
+        "profile", "experience", "education", "skills",
+        "certifications", "languages",
+    }
+
+    async def fetch(self, slug: str, client: Any) -> FetchResult | None:
+        """Fetch the profile via flagship-web RSC endpoints.
+
+        1. GET /flagship-web/in/{slug}/ — main page (profile header + education + photos)
+        2. GET /flagship-web/rsc-action/actions/component?componentId=...profileCardsExperienceOnly
+           — experience section
+        3. Optionally fetch BelowActivity parts for languages/skills/certs
+
+        Returns a FetchResult with a dict payload containing 'texts_main' and
+        'texts_experience' (and optionally 'texts_languages' etc.) that the mapper
+        functions consume.
+        """
+        # 1. Main profile page
+        main_url = f"{FLAGSHIP_BASE}/in/{up.quote(slug)}/"
+        main_texts = await _fetch_and_extract(client, main_url)
+        if not main_texts:
+            return None
+
+        # 2. Experience section
+        exp_url = (
+            f"{FLAGSHIP_BASE}/rsc-action/actions/component"
+            f"?componentId=com.linkedin.sdui.generated.profile.dsl.impl.profileCardsExperienceOnly"
+            f"&sduiid=com.linkedin.sdui.generated.profile.dsl.impl.profileCardsExperienceOnly"
+        )
+        exp_texts = await _fetch_and_extract(client, exp_url)
+
+        # 3. Languages section (optional, may be empty)
+        lang_url = (
+            f"{FLAGSHIP_BASE}/rsc-action/actions/component"
+            f"?componentId=com.linkedin.sdui.generated.profile.dsl.impl.profileCardsBelowActivityPart4"
+        )
+        lang_texts = await _fetch_and_extract(client, lang_url)
+
+        payload = {
+            "_source": "flagship_web_rsc",
+            "main_texts": main_texts,
+            "experience_texts": exp_texts or [],
+            "language_texts": lang_texts or [],
+        }
+
+        # Extract profile URN from main texts
+        profile_urn = _extract_profile_urn(main_texts)
+
+        return FetchResult(payload=payload, profile_urn=profile_urn, source=self.name)
+
+
+async def _fetch_and_extract(client: Any, url: str) -> list[str] | None:
+    """Fetch a URL via the client and extract text from the RSC response.
+
+    The flagship-web strategy needs cookies but uses the same curl_cffi transport.
+    We call client.fetch (which acquires a session) and then parse the body.
+    """
+    try:
+        resp = await client.fetch(url)
+    except Exception as e:
+        log.warning("flagship.fetch_error", url=url[:100], error=str(e))
+        return None
+
+    if resp.outcome.value != "ok":
+        log.warning("flagship.non_ok", url=url[:100], outcome=resp.outcome.value)
+        return None
+
+    body = resp.body_bytes
+    if not body:
+        return None
+
+    # The body may be base64-encoded RSC, or HTML, or plain text.
+    body_str = body.decode("utf-8", errors="replace")
+    texts = extract_text(body_str)
+    return texts if texts else None
+
+
+# --- mapping functions -------------------------------------------------------
+
+def map_profile_from_rsc(texts: list[str]) -> Profile:
+    """Map the core profile fields from the main page RSC text list."""
+    # Name: the first occurrence of a "First Last" pattern after "Primary content"
+    # or the title "Name | LinkedIn"
+    full_name = None
+    first_name = None
+    last_name = None
+    headline = None
+    location_raw = None
+    industry = None
+    about = None
+    profile_urn = None
+
+    for i, t in enumerate(texts):
+        # Profile URN
+        if not profile_urn and t.startswith("ACoAA"):
+            profile_urn = t
+
+        # Title tag: "Name | LinkedIn"
+        if "| LinkedIn" in t and full_name is None:
+            full_name = t.replace(" | LinkedIn", "").strip()
+
+        # Headline: appears after the name in the topcard, often before "Send profile"
+        if full_name and not headline and "Send profile" in t:
+            # The headline is the text just before "Send profile in a message"
+            if i > 0 and texts[i - 1] and len(texts[i - 1]) > 5 and "LinkedIn" not in texts[i - 1]:
+                headline = texts[i - 1]
+
+    # Fallback: look for name after "Primary content"
+    if not full_name:
+        for i, t in enumerate(texts):
+            if t == "Primary content" and i + 1 < len(texts):
+                candidate = texts[i + 1]
+                if " " in candidate and len(candidate) > 3 and "LinkedIn" not in candidate:
+                    full_name = candidate
+                    break
+
+    if full_name:
+        parts = full_name.split(" ", 1)
+        first_name = parts[0] if parts else None
+        last_name = parts[1] if len(parts) > 1 else None
+
+    # Location: look for a pattern like "City, Region, Country"
+    for t in texts:
+        if not location_raw and re.match(r"^[A-Z][a-zA-Z\s]+,\s[A-Z][a-zA-Z\s]+,\s[A-Z]", t):
+            location_raw = t
+            break
+
+    # Education + company summary: "Company · School" pattern
+    education_school = None
+    for t in texts:
+        if " · " in t and not education_school:
+            parts = t.split(" · ")
+            if len(parts) == 2:
+                education_school = parts[1].strip()
+
+    # Images: find profile photo and cover photo URLs
+    images = _map_images_from_texts(texts)
+
+    loc = Location(raw=location_raw) if location_raw else None
+
+    return Profile(
+        first_name=first_name,
+        last_name=last_name,
+        full_name=full_name,
+        headline=headline,
+        about=about,
+        location=loc,
+        industry=industry,
+        pronouns=None,
+        flags=ProfileFlags(),
+        images=images,
+        counts=Counts(),
+    )
+
+
+def _extract_profile_urn(texts: list[str]) -> str | None:
+    """Extract the profile URN (ACoAA...) from the main page texts."""
+    for t in texts:
+        if t.startswith("ACoAA") and len(t) > 10:
+            return t
+    return None
+
+
+def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
+    """Map experience positions from the experience section RSC text list.
+
+    The texts are in document order. Each position block follows this pattern:
+      <company_name>
+      <total_duration_at_company>   ("1 yr 8 mos")
+      <location>                    ("Gurugram, Haryana, India")
+      <title>                       ("Analyst")
+      <employment_type>             ("Full-time" / "Internship")
+      <date_range>                  ("Jul 2025 - Present · 1 yr 2 mos")
+      <location_type>               ("On-site" / "Hybrid" / "Remote")
+
+    The date_range is the anchor. We walk forwards from each date_range to get
+    location_type, and walk backwards to get title, employment_type, location,
+    and company name.
+    """
+    DATE_RE = re.compile(
+        r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}\s*[-\u2013]\s*"
+        r"(?:Present|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})"
+        r"(?:\s*[·•]\s*(\d+\s+yr[s]?\s+\d+\s+mos?|\d+\s+mos?|\d+\s+yr[s]?))?"
+    )
+    DURATION_RE = re.compile(r"^(\d+\s+yr[s]?\s+\d+\s+mos?|\d+\s+mos?|\d+\s+yr[s]?)$")
+    EMPLOYMENT_TYPES = {"Full-time", "Part-time", "Internship", "Contract", "Freelance", "Self-employed"}
+    LOCATION_TYPES = {"On-site", "Hybrid", "Remote"}
+    LOCATION_RE = re.compile(r"^[A-Z][a-zA-Z\s]+,\s[A-Z][a-zA-Z\s]+")
+    SKILLS_RE = re.compile(r".*\+\d+ skills$")
+
+    positions: list[Experience] = []
+    i = 0
+    while i < len(texts):
+        t = texts[i]
+        date_match = DATE_RE.match(t)
+        if date_match:
+            title = None
+            company_name = None
+            employment_type = None
+            location = None
+            location_type = None
+            date_str = t
+
+            # Walk backwards: immediately before the date is employment_type,
+            # before that is the title, before that may be location, before
+            # that is the company name (with duration in between).
+            j = i - 1
+            # employment_type — but check for "Company · Type" composite first
+            composite_handled = False
+            if j >= 0 and " · " in (texts[j] or ""):
+                # "BDO · Internship" — company · employment_type composite
+                parts = texts[j].split(" · ")
+                if len(parts) == 2 and parts[1] in EMPLOYMENT_TYPES:
+                    company_name = parts[0].strip()
+                    employment_type = parts[1].strip()
+                    composite_handled = True
+                    j -= 1
+            if not composite_handled:
+                # employment_type alone
+                if j >= 0 and texts[j] in EMPLOYMENT_TYPES:
+                    employment_type = texts[j]
+                    j -= 1
+                # title
+                if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
+                    title = texts[j]
+                    j -= 1
+                # location (optional) — stop if we hit a date or location_type from prev block
+                if j >= 0 and LOCATION_RE.match(texts[j] or ""):
+                    location = texts[j]
+                    j -= 1
+                # Skip duration-only and skills lines
+                while j >= 0 and (DURATION_RE.match(texts[j] or "") or SKILLS_RE.match(texts[j] or "")):
+                    j -= 1
+                # company name — stop at dates and location_types
+                if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
+                    candidate = texts[j]
+                    if candidate and not candidate.endswith(" logo") and not candidate.startswith("http"):
+                        company_name = candidate
+            else:
+                # Composite was handled; the title is before the composite
+                if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
+                    title = texts[j]
+                    j -= 1
+
+            # Walk forwards: location_type may follow the date
+            k = i + 1
+            if k < len(texts) and texts[k] in LOCATION_TYPES:
+                location_type = texts[k]
+
+            # If location not found backwards, check the forward "City · LocationType" pattern
+            if not location and k < len(texts):
+                nxt = texts[k] if k < len(texts) else ""
+                if nxt and " · " in nxt:
+                    parts = nxt.split(" · ")
+                    location = parts[0].strip()
+                    if not location_type and len(parts) > 1:
+                        location_type = parts[1].strip()
+
+            start, end, is_current = _parse_date_range(date_str)
+
+            positions.append(Experience(
+                title=title,
+                employment_type=employment_type,
+                company=CompanyRef(name=company_name) if company_name else None,
+                location=location,
+                location_type=location_type,
+                start=DatePart(**start) if start else None,
+                end=DatePart(**end) if end else None,
+                is_current=is_current,
+                duration_months=_parse_duration_months(date_str),
+                description=None,
+                skills=[],
+            ))
+        i += 1
+    return positions
+
+
+def _parse_date_range(date_str: str) -> tuple[dict | None, dict | None, bool]:
+    """Parse 'Jul 2025 - Present · 1 yr 2 mos' into (start, end, is_current)."""
+    MONTHS = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+              "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
+    # Strip the duration part
+    parts = date_str.split("·")
+    date_part = parts[0].strip()
+    is_current = "Present" in date_part
+
+    # Split on " - " or " \u2013 " (en dash, which LinkedIn sometimes uses)
+    range_parts = re.split(r"\s*[-\u2013]\s*", date_part)
+    if len(range_parts) != 2:
+        return None, None, is_current
+
+    start_str, end_str = range_parts[0].strip(), range_parts[1].strip()
+
+    start = _parse_month_year(start_str, MONTHS)
+    end = None if is_current else _parse_month_year(end_str, MONTHS)
+
+    return start, end, is_current
+
+
+def _parse_month_year(s: str, months: dict) -> dict | None:
+    """Parse 'Jul 2025' into {'year': 2025, 'month': 7, 'day': None, 'iso': '2025-07'}."""
+    m = re.match(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})$", s.strip())
+    if not m:
+        return None
+    month = months.get(m.group(1))
+    year = int(m.group(2))
+    if not month:
+        return None
+    return {"year": year, "month": month, "day": None, "iso": f"{year:04d}-{month:02d}"}
+
+
+def _parse_duration_months(date_str: str) -> int | None:
+    """Parse 'Jul 2025 - Present · 1 yr 2 mos' -> 14 (approx). Best-effort."""
+    # Extract the duration part after ·
+    parts = date_str.split("·")
+    if len(parts) < 2:
+        return None
+    dur_str = parts[1].strip()
+    m = re.match(r"(\d+)\s+yr[s]?\s+(\d+)\s+mos?", dur_str)
+    if m:
+        return int(m.group(1)) * 12 + int(m.group(2))
+    m = re.match(r"(\d+)\s+mos?", dur_str)
+    if m:
+        return int(m.group(1))
+    m = re.match(r"(\d+)\s+yr[s]?", dur_str)
+    if m:
+        return int(m.group(1)) * 12
+    return None
+
+
+def map_education_from_rsc(texts: list[str]) -> list[Education]:
+    """Map education from the main page texts.
+
+    Education appears as school name in the "Company · School" pattern in the topcard,
+    or as a standalone school name. For the current transport, education is limited
+    to the school name in the topcard summary.
+    """
+    schools: list[Education] = []
+    for t in texts:
+        if " · " in t:
+            parts = t.split(" · ")
+            if len(parts) == 2:
+                school_name = parts[1].strip()
+                if school_name and len(school_name) > 3:
+                    schools.append(Education(school=school_name))
+                    break
+    return schools
+
+
+def map_languages_from_rsc(texts: list[str]) -> list[Language]:
+    """Map languages from the BelowActivity Part4 texts.
+
+    Pattern: after "Languages" header, pairs of (language, proficiency).
+    """
+    languages: list[Language] = []
+    in_languages = False
+    i = 0
+    while i < len(texts):
+        t = texts[i]
+        if t == "Languages":
+            in_languages = True
+            i += 1
+            continue
+        if in_languages:
+            # Skip noise
+            if t.startswith("ProfileNullState") or t.startswith("LanguageTopLevel") or "plural" in t or t == "en_US":
+                i += 1
+                continue
+            # Check if this is a language name (capitalized, short, not a proficiency)
+            if re.match(r"^[A-Z][a-z]+$", t) and len(t) < 30:
+                # Look ahead for proficiency
+                proficiency = None
+                if i + 1 < len(texts):
+                    next_t = texts[i + 1]
+                    if "proficiency" in next_t.lower() or "bilingual" in next_t.lower() or "native" in next_t.lower():
+                        proficiency = next_t
+                        i += 1
+                languages.append(Language(name=t, proficiency=proficiency))
+        i += 1
+    return languages
+
+
+def _map_images_from_texts(texts: list[str]) -> ProfileImages:
+    """Extract profile photo and background photo URLs from the main page texts."""
+    profile_imgs: list[Image] = []
+    bg_imgs: list[Image] = []
+
+    in_profile_photo = False
+    for t in texts:
+        if t == "Profile photo":
+            in_profile_photo = True
+            continue
+        if t == "Cover photo":
+            in_profile_photo = False
+            continue
+        if t.startswith("https://media.licdn.com/dms/image") and "profile-displayphoto" in t:
+            if in_profile_photo or not bg_imgs:
+                profile_imgs.append(Image(url=t, expires_at=parse_image_expiry(t)))
+        elif t.startswith("https://media.licdn.com/dms/image") and "profile-displaybackgroundimage" in t:
+            bg_imgs.append(Image(url=t, expires_at=parse_image_expiry(t)))
+
+    return ProfileImages(profile=profile_imgs, background=bg_imgs)

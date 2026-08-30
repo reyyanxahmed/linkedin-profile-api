@@ -21,6 +21,7 @@ from app.errors import ConfigError
 from app.linkedin.client import LinkedInClient
 from app.linkedin.strategies import FetchResult, Strategy
 from app.linkedin.strategies.dash import DashStrategy
+from app.linkedin.strategies.flagship_web import FlagshipWebStrategy
 from app.linkedin.strategies.graphql import GraphQLStrategy
 from app.linkedin.strategies.legacy import LegacyStrategy
 from app.linkedin.strategies.public_html import PublicHtmlStrategy
@@ -60,12 +61,17 @@ def load_queries(path: str = "app/linkedin/queries.yaml") -> dict:
 def build_strategies(queries: dict) -> list[Strategy]:
     """Construct the strategy chain from queries.yaml values.
 
+    The flagship-web RSC strategy is the primary path (LinkedIn migrated to this
+    transport). Voyager strategies (GraphQL, dash, legacy) are kept as fallbacks
+    in case RSC is unavailable or returns partial data.
+
     Strategies with placeholder config still get constructed; they raise ConfigError
     at fetch time (caught by the orchestrator) and degrade to the next strategy.
     """
     graphql_cfg = queries.get("graphql", {}) or {}
     dash_cfg = queries.get("dash", {}) or {}
     return [
+        FlagshipWebStrategy(),  # primary — LinkedIn's current transport
         GraphQLStrategy(graphql_cfg.get("profile_cards_query_id", "")),
         DashStrategy(dash_cfg.get("full_profile_decoration_id", "")),
         LegacyStrategy(),
