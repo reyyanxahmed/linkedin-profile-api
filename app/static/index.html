@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LinkedIn Profile API</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0a0f;--surface:#12121a;--surface2:#1a1a26;--border:#26263a;
+  --text:#e8e8f0;--text-dim:#8888a0;--text-muted:#5a5a72;
+  --accent:#7c8cff;--accent2:#4f6bff;--accent-glow:rgba(124,140,255,.15);
+  --green:#4ade80;--amber:#fbbf24;--red:#f87171;
+  --radius:12px;--radius-sm:8px;
+}
+html{scroll-behavior:smooth}
+body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;min-height:100vh;overflow-x:hidden}
+a{color:var(--accent);text-decoration:none}
+
+/* Background gradient */
+body::before{content:'';position:fixed;top:0;left:0;width:100%;height:600px;
+  background:radial-gradient(ellipse 80% 60% at 50% 0%,rgba(124,140,255,.08),transparent);
+  pointer-events:none;z-index:0}
+
+/* Layout */
+.container{max-width:900px;margin:0 auto;padding:0 24px;position:relative;z-index:1}
+
+/* Header */
+header{padding:48px 0 32px;text-align:center}
+header h1{font-size:28px;font-weight:700;letter-spacing:-.5px;margin-bottom:6px}
+header h1 span{color:var(--accent)}
+header p{color:var(--text-dim);font-size:14px}
+
+/* Search bar */
+.search-bar{display:flex;gap:0;margin-bottom:40px;border-radius:var(--radius);
+  overflow:hidden;border:1px solid var(--border);background:var(--surface);
+  transition:border-color .2s}
+.search-bar:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-glow)}
+.search-bar input{flex:1;padding:14px 18px;background:none;border:none;color:var(--text);
+  font-size:15px;font-family:inherit;outline:none}
+.search-bar input::placeholder{color:var(--text-muted)}
+.search-bar button{padding:14px 28px;background:var(--accent2);border:none;color:#fff;
+  font-size:14px;font-weight:600;font-family:inherit;cursor:pointer;transition:background .2s}
+.search-bar button:hover{background:var(--accent)}
+.search-bar button:disabled{opacity:.5;cursor:not-allowed}
+
+/* Loading */
+.loading{text-align:center;padding:60px 0}
+.loading .spinner{width:36px;height:36px;border:3px solid var(--border);
+  border-top-color:var(--accent);border-radius:50%;margin:0 auto 16px;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loading p{color:var(--text-dim);font-size:14px}
+
+/* Error */
+.error{text-align:center;padding:48px 0}
+.error .code{font-size:14px;color:var(--red);font-weight:600;margin-bottom:8px}
+.error .msg{color:var(--text-dim);font-size:15px}
+
+/* Profile card */
+.profile-card{background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);overflow:hidden;margin-bottom:24px;animation:fadeUp .3s ease}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+
+/* Cover */
+.cover{height:140px;position:relative;overflow:hidden}
+.cover img{width:100%;height:100%;object-fit:cover}
+.cover-fallback{height:100%;background:linear-gradient(135deg,var(--surface2),var(--border))}
+
+/* Header section */
+.profile-header{padding:0 28px 24px;position:relative}
+.avatar{width:120px;height:120px;border-radius:50%;border:4px solid var(--surface);
+  margin-top:-60px;position:relative;z-index:1;overflow:hidden;background:var(--surface2)}
+.avatar img{width:100%;height:100%;object-fit:cover}
+.avatar-fallback{width:100%;height:100%;display:flex;align-items:center;justify-content:center;
+  font-size:42px;font-weight:700;color:var(--accent)}
+
+.profile-name{font-size:24px;font-weight:700;margin-top:12px;letter-spacing:-.3px}
+.profile-headline{color:var(--text-dim);font-size:15px;margin-top:4px;line-height:1.5}
+.profile-meta{display:flex;flex-wrap:wrap;gap:6px 16px;margin-top:12px}
+.meta-item{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-muted)}
+.meta-item svg{width:15px;height:15px;opacity:.7;flex-shrink:0}
+.meta-item a{color:var(--text-muted)}
+.meta-item a:hover{color:var(--accent)}
+
+/* Badges row */
+.badges{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:4px 10px;
+  border-radius:20px;font-size:12px;font-weight:500}
+.badge-source{background:rgba(124,140,255,.12);color:var(--accent)}
+.badge-completeness{background:rgba(74,222,128,.12);color:var(--green)}
+.badge-completeness.medium{background:rgba(251,191,36,.12);color:var(--amber)}
+.badge-completeness.low{background:rgba(248,113,113,.12);color:var(--red)}
+.badge-stale{background:rgba(251,191,36,.12);color:var(--amber)}
+.badge-dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+
+/* Flags */
+.flags{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.flag{font-size:12px;padding:3px 10px;border-radius:6px;background:var(--surface2);
+  color:var(--text-dim);border:1px solid var(--border)}
+
+/* Section */
+.section{padding:24px 28px;border-top:1px solid var(--border)}
+.section-title{font-size:16px;font-weight:600;margin-bottom:16px;display:flex;
+  align-items:center;justify-content:space-between}
+.section-title .count{font-size:12px;color:var(--text-muted);font-weight:400}
+.section-empty{color:var(--text-muted);font-size:14px;font-style:italic;padding:8px 0}
+
+/* Experience timeline */
+.exp-item{padding:16px 0;border-bottom:1px solid var(--border);display:flex;gap:16px}
+.exp-item:last-child{border-bottom:none}
+.exp-logo{width:48px;height:48px;border-radius:8px;overflow:hidden;flex-shrink:0;
+  background:var(--surface2);border:1px solid var(--border)}
+.exp-logo img{width:100%;height:100%;object-fit:cover}
+.exp-logo-fallback{width:100%;height:100%;display:flex;align-items:center;
+  justify-content:center;font-size:16px;font-weight:700;color:var(--accent)}
+.exp-body{flex:1;min-width:0}
+.exp-title{font-size:15px;font-weight:600}
+.exp-company{font-size:13px;color:var(--text-dim);margin-top:2px}
+.exp-date{font-size:12px;color:var(--text-muted);margin-top:4px;
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.exp-date .dot{width:3px;height:3px;border-radius:50%;background:var(--text-muted)}
+.exp-current{color:var(--green);font-weight:600;font-size:12px}
+.exp-location{font-size:12px;color:var(--text-muted);margin-top:2px}
+.exp-type{font-size:12px;color:var(--text-muted);margin-top:2px}
+.exp-desc{font-size:13px;color:var(--text-dim);margin-top:8px;line-height:1.6}
+.exp-skills{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+.exp-skill{font-size:11px;padding:2px 8px;border-radius:4px;
+  background:var(--surface2);color:var(--text-dim)}
+
+/* Education */
+.edu-item{padding:12px 0;border-bottom:1px solid var(--border)}
+.edu-item:last-child{border-bottom:none}
+.edu-school{font-size:15px;font-weight:600}
+.edu-degree{font-size:13px;color:var(--text-dim);margin-top:2px}
+.edu-date{font-size:12px;color:var(--text-muted);margin-top:4px}
+
+/* Skills */
+.skills-grid{display:flex;flex-wrap:wrap;gap:8px}
+.skill-tag{padding:6px 14px;border-radius:20px;background:var(--surface2);
+  border:1px solid var(--border);font-size:13px;display:flex;align-items:center;gap:6px}
+.skill-tag .endorsements{font-size:11px;color:var(--text-muted)}
+
+/* Languages */
+.lang-grid{display:flex;flex-wrap:wrap;gap:8px}
+.lang-tag{padding:6px 14px;border-radius:8px;background:var(--surface2);
+  border:1px solid var(--border)}
+.lang-name{font-size:13px;font-weight:500}
+.lang-prof{font-size:11px;color:var(--text-muted);margin-top:2px}
+
+/* Certifications */
+.cert-item{padding:12px 0;border-bottom:1px solid var(--border)}
+.cert-item:last-child{border-bottom:none}
+.cert-name{font-size:15px;font-weight:600}
+.cert-auth{font-size:13px;color:var(--text-dim);margin-top:2px}
+.cert-date{font-size:12px;color:var(--text-muted);margin-top:4px}
+
+/* JSON view toggle */
+.json-toggle{text-align:center;margin:24px 0}
+.json-toggle button{padding:8px 20px;border-radius:8px;border:1px solid var(--border);
+  background:var(--surface);color:var(--text-dim);font-size:13px;cursor:pointer;
+  font-family:inherit;transition:all .2s}
+.json-toggle button:hover{border-color:var(--accent);color:var(--accent)}
+.json-view{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  padding:20px;margin-bottom:24px;overflow-x:auto;display:none}
+.json-view pre{font-family:'SF Mono',Menlo,monospace;font-size:12px;line-height:1.6;
+  color:var(--text-dim);white-space:pre-wrap;word-break:break-all}
+.json-view .json-key{color:var(--accent)}
+.json-view .json-string{color:var(--green)}
+.json-view .json-number{color:var(--amber)}
+
+/* Footer */
+footer{text-align:center;padding:40px 0;color:var(--text-muted);font-size:13px}
+footer a{color:var(--text-dim)}
+footer .docs-link{margin-top:8px}
+
+/* Responsive */
+@media(max-width:640px){
+  .container{padding:0 16px}
+  header{padding:32px 0 24px}
+  header h1{font-size:22px}
+  .profile-header{padding:0 18px 20px}
+  .section{padding:20px 18px}
+  .search-bar input{font-size:14px;padding:12px 14px}
+  .search-bar button{padding:12px 18px}
+  .avatar{width:96px;height:96px;margin-top:-48px}
+  .profile-name{font-size:20px}
+  .exp-logo{width:40px;height:40px}
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <h1>LinkedIn <span>Profile API</span></h1>
+  <p>Enter a LinkedIn profile URL to get structured JSON — no browser, direct HTTP</p>
+</header>
+
+<div class="search-bar">
+  <input type="text" id="url-input" placeholder="https://www.linkedin.com/in/barackobama" spellcheck="false" autocomplete="off">
+  <button id="fetch-btn" onclick="fetchProfile()">Fetch Profile</button>
+</div>
+
+<div id="result"></div>
+
+<div id="json-section" style="display:none">
+  <div class="json-toggle">
+    <button onclick="toggleJson()">View Raw JSON</button>
+  </div>
+  <div class="json-view" id="json-view">
+    <pre id="json-raw"></pre>
+  </div>
+</div>
+
+<footer>
+  <p>Built with FastAPI + curl_cffi (TLS impersonation) + LinkedIn RSC parser</p>
+  <p class="docs-link"><a href="/docs">API Docs</a> &middot; <a href="/v1/health">Health</a></p>
+</footer>
+
+</div>
+
+<script>
+const API_KEY = localStorage.getItem('api_key') || '';
+const resultDiv = document.getElementById('result');
+const jsonSection = document.getElementById('json-section');
+
+document.getElementById('url-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') fetchProfile();
+});
+
+async function fetchProfile() {
+  const input = document.getElementById('url-input').value.trim();
+  const btn = document.getElementById('fetch-btn');
+  if (!input) return;
+
+  // Normalize: if it's just a slug, prepend the LinkedIn URL
+  let url = input;
+  if (!url.startsWith('http') && !url.includes('linkedin.com')) {
+    url = 'https://www.linkedin.com/in/' + url;
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'Fetching...';
+  resultDiv.innerHTML = loadingHtml();
+  jsonSection.style.display = 'none';
+
+  const params = new URLSearchParams({ url, refresh: 'false' });
+  const headers = {};
+  if (API_KEY) headers['X-API-Key'] = API_KEY;
+
+  try {
+    const resp = await fetch('/v1/profile?' + params, { headers });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      resultDiv.innerHTML = errorHtml(data);
+      btn.disabled = false;
+      btn.textContent = 'Fetch Profile';
+      return;
+    }
+
+    resultDiv.innerHTML = renderProfile(data);
+    jsonSection.style.display = 'block';
+    document.getElementById('json-raw').innerHTML = syntaxHighlight(JSON.stringify(data, null, 2));
+    btn.disabled = false;
+    btn.textContent = 'Fetch Profile';
+  } catch (err) {
+    resultDiv.innerHTML = errorHtml({ error: { code: 'NETWORK', message: err.message } });
+    btn.disabled = false;
+    btn.textContent = 'Fetch Profile';
+  }
+}
+
+function loadingHtml() {
+  return `<div class="loading"><div class="spinner"></div><p>Fetching profile from LinkedIn...</p></div>`;
+}
+
+function errorHtml(data) {
+  const e = data.error || {};
+  return `<div class="error">
+    <div class="code">${e.code || 'ERROR'}</div>
+    <div class="msg">${e.message || 'Something went wrong'}</div>
+  </div>`;
+}
+
+function renderProfile(d) {
+  const p = d.profile || {};
+  const m = d.meta || {};
+  const exp = d.experience || [];
+  const edu = d.education || [];
+  const skills = d.skills || [];
+  const langs = d.languages || [];
+  const certs = d.certifications || [];
+  const projects = d.projects || [];
+  const honors = d.honors || [];
+  const volunteer = d.volunteer || [];
+  const courses = d.courses || [];
+
+  const profileImg = (p.images && p.images.profile && p.images.profile.length) ? p.images.profile[0].url : '';
+  const bgImg = (p.images && p.images.background && p.images.background.length) ? p.images.background[0].url : '';
+
+  const completenessClass = m.completeness >= 0.7 ? '' : m.completeness >= 0.4 ? 'medium' : 'low';
+  const partialHtml = m.partial_sections && m.partial_sections.length
+    ? `<span class="flag" title="Sections that degraded">partial: ${m.partial_sections.join(', ')}</span>` : '';
+
+  const flagsHtml = p.flags ? [
+    p.flags.premium && '<span class="flag">Premium</span>',
+    p.flags.influencer && '<span class="flag">Influencer</span>',
+    p.flags.open_to_work && '<span class="flag">Open to Work</span>',
+    p.flags.hiring && '<span class="flag">Hiring</span>',
+  ].filter(Boolean).join('') : '';
+
+  return `
+  <div class="profile-card">
+    <div class="cover">${bgImg ? `<img src="${esc(bgImg)}" alt="">` : '<div class="cover-fallback"></div>'}</div>
+    <div class="profile-header">
+      <div class="avatar">${profileImg ? `<img src="${esc(profileImg)}" alt="">` : `<div class="avatar-fallback">${esc(initials(p.full_name))}</div>`}</div>
+      <div class="profile-name">${esc(p.full_name || 'Unknown')}</div>
+      ${p.headline ? `<div class="profile-headline">${esc(p.headline)}</div>` : ''}
+      <div class="profile-meta">
+        ${p.location && p.location.raw ? metaItem('location', p.location.raw) : ''}
+        ${p.industry ? metaItem('industry', p.industry) : ''}
+        ${m.profile_urn ? `<span class="meta-item"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M4 2v14l4-3 4 3V2H4z"/></svg>URN: ${esc(m.profile_urn.substring(0, 20))}...</span>` : ''}
+      </div>
+      <div class="badges">
+        <span class="badge badge-source"><span class="badge-dot"></span>${esc(m.source || 'unknown')}</span>
+        <span class="badge badge-completeness ${completenessClass}"><span class="badge-dot"></span>${Math.round((m.completeness||0)*100)}% complete</span>
+        ${m.cache && m.cache.stale ? '<span class="badge badge-stale"><span class="badge-dot"></span>stale cache</span>' : ''}
+        ${m.cache && m.cache.hit ? '<span class="badge badge-stale"><span class="badge-dot"></span>cache hit</span>' : ''}
+      </div>
+      ${flagsHtml || partialHtml ? `<div class="flags">${flagsHtml}${partialHtml}</div>` : ''}
+    </div>
+
+    ${exp.length ? renderExperience(exp) : ''}
+    ${edu.length ? renderEducation(edu) : ''}
+    ${skills.length ? renderSkills(skills) : ''}
+    ${langs.length ? renderLanguages(langs) : ''}
+    ${certs.length ? renderCerts(certs) : ''}
+    ${volunteer.length ? renderVolunteer(volunteer) : ''}
+    ${honors.length ? renderHonors(honors) : ''}
+    ${projects.length ? renderProjects(projects) : ''}
+    ${courses.length ? renderCourses(courses) : ''}
+  </div>`;
+}
+
+function renderExperience(exp) {
+  return `<div class="section">
+    <div class="section-title">Experience <span class="count">${exp.length} role${exp.length>1?'s':''}</span></div>
+    ${exp.map(e => {
+      const logo = e.company && e.company.logo;
+      const company = e.company && e.company.name;
+      const dates = formatDates(e.start, e.end, e.is_current);
+      const dur = e.duration_months ? formatDuration(e.duration_months) : '';
+      return `<div class="exp-item">
+        <div class="exp-logo">${logo ? `<img src="${esc(logo)}" alt="">` : `<div class="exp-logo-fallback">${esc(initials(company))}</div>`}</div>
+        <div class="exp-body">
+          <div class="exp-title">${esc(e.title || '')}</div>
+          ${company ? `<div class="exp-company">${esc(company)}${e.company && e.company.linkedin_url ? ` &middot; <a href="${esc(e.company.linkedin_url)}" target="_blank">View</a>` : ''}</div>` : ''}
+          ${dates ? `<div class="exp-date">${dates}${dur ? `<span class="dot"></span>${dur}` : ''}${e.is_current ? '<span class="dot"></span><span class="exp-current">Present</span>' : ''}</div>` : ''}
+          ${e.location ? `<div class="exp-location">${locIcon()}${esc(e.location)}</div>` : ''}
+          ${e.location_type ? `<div class="exp-type">${esc(e.location_type)}</div>` : ''}
+          ${e.employment_type ? `<div class="exp-type">${esc(e.employment_type)}</div>` : ''}
+          ${e.description ? `<div class="exp-desc">${esc(e.description)}</div>` : ''}
+          ${e.skills && e.skills.length ? `<div class="exp-skills">${e.skills.map(s => `<span class="exp-skill">${esc(s)}</span>`).join('')}</div>` : ''}
+        </div>
+      </div>`;
+    }).join('')}
+  </div>`;
+}
+
+function renderEducation(edu) {
+  return `<div class="section">
+    <div class="section-title">Education <span class="count">${edu.length}</span></div>
+    ${edu.map(e => `<div class="edu-item">
+      <div class="edu-school">${esc(e.school || '')}</div>
+      ${e.degree || e.field_of_study ? `<div class="edu-degree">${[e.degree, e.field_of_study].filter(Boolean).map(esc).join(', ')}</div>` : ''}
+      ${formatDates(e.start, e.end, false) ? `<div class="edu-date">${formatDates(e.start, e.end, false)}</div>` : ''}
+      ${e.activities ? `<div class="exp-desc">${esc(e.activities)}</div>` : ''}
+    </div>`).join('')}
+  </div>`;
+}
+
+function renderSkills(skills) {
+  return `<div class="section">
+    <div class="section-title">Skills <span class="count">${skills.length}</span></div>
+    <div class="skills-grid">
+      ${skills.map(s => `<span class="skill-tag">${esc(s.name||'')}${s.endorsement_count ? `<span class="endorsements">${s.endorsement_count}</span>` : ''}</span>`).join('')}
+    </div>
+  </div>`;
+}
+
+function renderLanguages(langs) {
+  return `<div class="section">
+    <div class="section-title">Languages <span class="count">${langs.length}</span></div>
+    <div class="lang-grid">
+      ${langs.map(l => `<div class="lang-tag"><div class="lang-name">${esc(l.name||'')}</div>${l.proficiency ? `<div class="lang-prof">${esc(l.proficiency)}</div>` : ''}</div>`).join('')}
+    </div>
+  </div>`;
+}
+
+function renderCerts(certs) {
+  return `<div class="section">
+    <div class="section-title">Certifications <span class="count">${certs.length}</span></div>
+    ${certs.map(c => `<div class="cert-item">
+      <div class="cert-name">${esc(c.name||'')}</div>
+      ${c.authority ? `<div class="cert-auth">${esc(c.authority)}</div>` : ''}
+      ${c.issued && c.issued.iso ? `<div class="cert-date">Issued ${esc(c.issued.iso)}</div>` : ''}
+    </div>`).join('')}
+  </div>`;
+}
+
+function renderVolunteer(vol) {
+  return `<div class="section">
+    <div class="section-title">Volunteer <span class="count">${vol.length}</span></div>
+    ${vol.map(v => `<div class="edu-item">
+      <div class="edu-school">${esc(v.title||'')}</div>
+      ${v.organization ? `<div class="edu-degree">${esc(v.organization)}</div>` : ''}
+    </div>`).join('')}
+  </div>`;
+}
+
+function renderHonors(honors) {
+  return `<div class="section">
+    <div class="section-title">Honors & Awards <span class="count">${honors.length}</span></div>
+    ${honors.map(h => `<div class="cert-item">
+      <div class="cert-name">${esc(h.title||'')}</div>
+      ${h.issuer ? `<div class="cert-auth">${esc(h.issuer)}</div>` : ''}
+    </div>`).join('')}
+  </div>`;
+}
+
+function renderProjects(projects) {
+  return `<div class="section">
+    <div class="section-title">Projects <span class="count">${projects.length}</span></div>
+    ${projects.map(p => `<div class="edu-item">
+      <div class="edu-school">${esc(p.title||'')}</div>
+      ${p.description ? `<div class="edu-degree">${esc(p.description)}</div>` : ''}
+    </div>`).join('')}
+  </div>`;
+}
+
+function renderCourses(courses) {
+  return `<div class="section">
+    <div class="section-title">Courses <span class="count">${courses.length}</span></div>
+    ${courses.map(c => `<div class="edu-item"><div class="edu-school">${esc(c.name||'')}</div></div>`).join('')}
+  </div>`;
+}
+
+// --- helpers ---
+
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function initials(name) {
+  if (!name) return '?';
+  return name.split(' ').slice(0,2).map(w => w[0]||'').join('').toUpperCase();
+}
+
+function metaItem(icon, text) {
+  const icons = {
+    location: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1C5.2 1 3 3.2 3 6c0 3.7 5 8.7 5 8.7s5-5 5-8.7c0-2.8-2.2-5-5-5zm0 7C6.9 8 6 7.1 6 6s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>',
+    industry: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M2 14V6l4-2v2l4-2v2l4-2v8H2z"/></svg>',
+  };
+  return `<span class="meta-item">${icons[icon]||''}${esc(text)}</span>`;
+}
+
+function locIcon() {
+  return '<svg style="width:12px;height:12px;opacity:.6;margin-right:3px" viewBox="0 0 16 16" fill="currentColor"><path d="M8 1C5.2 1 3 3.2 3 6c0 3.7 5 8.7 5 8.7s5-5 5-8.7c0-2.8-2.2-5-5-5z"/></svg>';
+}
+
+function formatDates(start, end, isCurrent) {
+  const s = start && start.iso ? start.iso : '';
+  const e = isCurrent ? 'Present' : (end && end.iso ? end.iso : '');
+  if (!s && !e) return '';
+  return esc(s ? s : '') + (s && e ? ' — ' : '') + esc(e);
+}
+
+function formatDuration(months) {
+  if (!months) return '';
+  const y = Math.floor(months / 12);
+  const m = months % 12;
+  if (y && m) return `${y} yr${y>1?'s':''} ${m} mo${m>1?'s':''}`;
+  if (y) return `${y} yr${y>1?'s':''}`;
+  return `${m} mo${m>1?'s':''}`;
+}
+
+function syntaxHighlight(json) {
+  return json.replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+\.?\d*)/g, m => {
+    let cls = 'json-number';
+    if (/^"/.test(m)) cls = /:$/.test(m) ? 'json-key' : 'json-string';
+    else if (/true|false/.test(m)) cls = 'json-number';
+    return `<span class="${cls}">${m}</span>`;
+  });
+}
+
+function toggleJson() {
+  const v = document.getElementById('json-view');
+  v.style.display = v.style.display === 'none' ? 'block' : 'none';
+}
+
+// Auto-focus the input
+document.getElementById('url-input').focus();
+</script>
+</body>
+</html>

@@ -21,11 +21,12 @@ import hmac
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 
 import orjson
 from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel as PydanticBaseModel
 
 from app.cache import ProfileCache
@@ -124,6 +125,25 @@ app = FastAPI(
     version=APP_VERSION,
     lifespan=lifespan,
 )
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+@app.get("/", include_in_schema=False)
+async def serve_website() -> HTMLResponse:
+    """Serve the single-page website that wraps the API.
+
+    The API key is injected into the page so the frontend JS can call /v1/profile
+    without the user typing a key. The key is only exposed on the same origin —
+    external callers still need the X-API-Key header.
+    """
+    html = (STATIC_DIR / "index.html").read_text()
+    if settings.has_api_key:
+        html = html.replace(
+            "const API_KEY = localStorage.getItem('api_key') || '';",
+            f"const API_KEY = {orjson.dumps(settings.api_key).decode()};",
+        )
+    return HTMLResponse(content=html)
 
 
 # --- middleware (request id) -------------------------------------------------
