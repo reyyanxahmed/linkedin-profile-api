@@ -151,40 +151,56 @@ Every response carries an `X-Request-ID` header matching `meta.request_id`.
 
 HAR capture from an authenticated LinkedIn session using browser devtools. This is
 **recon only** — the browser is used to *discover* the endpoint shapes, then the
-solution talks to those endpoints directly via HTTP. The brief forbids browsers in the
-*solution*; it does not forbid them in *recon*, and using them for recon is exactly how
-reverse engineering works. The browser appears nowhere in the runtime, the Dockerfile,
+solution talks to those endpoints directly via HTTP. The brief forbids browsers in
+the *solution*; it does not forbid them in *recon*, and using them for recon is exactly
+how reverse engineering works. The browser appears nowhere in the runtime, the Dockerfile,
 or any runtime dependency.
 
-To refresh the captured identifiers:
+### The transport: flagship-web RSC (what LinkedIn actually uses now)
 
-```bash
-python scripts/extract_query_ids.py capture.har   # prints queryId / decorationId values
-python scripts/har_to_fixtures.py capture.har tests/fixtures/  # writes redacted fixtures
-```
+Analyzing the captured HAR revealed that **LinkedIn has migrated profile rendering from
+Voyager REST/GraphQL to flagship-web RSC (React Server Components)**. The Voyager
+endpoints documented in older reverse-engineering work (`/voyager/api/identity/profiles/`,
+`/voyager/api/graphql?queryId=...`) are either deprecated or return empty responses in
+current production traffic.
 
-### Three endpoint generations
+The live LinkedIn web app now fetches profile data through:
+1. `GET /flagship-web/in/{slug}/` — the main page, a base64-encoded RSC stream containing
+   the profile header (name, headline, education summary, photos, profile URN)
+2. `GET /flagship-web/rsc-action/actions/component?componentId=...profileCardsExperienceOnly`
+   — the experience section, a base64-encoded RSC stream with positions, companies, dates
+3. `GET /flagship-web/rsc-action/actions/component?componentId=...profileCardsBelowActivityPart4`
+   — the languages section (and other BelowActivity parts for skills, certifications, etc.)
 
-LinkedIn ships three coexisting generations of profile API. They break at different
-times, so supporting all three is the entire point of the fallback chain.
+The RSC wire format is a line-based protocol: each line is `id:type,json_payload`, where
+type `I` is a component import, type `T` is text/blob data, and type `[` is a component
+tree array. The component trees are HTML-like structures:
+`["$","p",null,{"children":["Analyst"]}]` — a `<p>` element with text content "Analyst".
 
-1. **Legacy REST** — `GET /voyager/api/identity/profiles/{slug}/profileView`. Most
-   convenient single call; partially deprecated. No queryId needed.
-2. **Dash** — `GET /voyager/api/identity/dash/profiles?q=memberIdentity&...`. Needs a
-   `decorationId` from `queries.yaml`. Resolves the slug to a profile URN, which
-   GraphQL needs.
-3. **GraphQL** — `GET /voyager/api/graphql?queryId=...&variables=(profileUrn:...)`.
-   What the live web app uses. Highest fidelity, most fragile (the `queryId` rotates
-   with frontend deploys). Needs a `profileUrn` (resolved from the slug via dash or
-   legacy first).
+**The RSC parser (`app/linkedin/rsc_parser.py`) decodes the base64, parses the line-based
+wire format, and walks the component tree depth-first to extract a flat list of
+human-readable text strings in document order.** The strategy then pattern-matches this
+text list (using date regexes, employment-type sets, location patterns) to reconstruct
+structured profile data.
 
-Plus an **unauthenticated public-HTML fallback**: `GET /in/{slug}` returns HTML with
-JSON-LD blocks. Heavily gated, but costs nothing and returns *something* useful when
-every session is cooling.
+This is the intellectual core of the submission, updated for LinkedIn's current transport.
+The old Voyager endpoints and the URN graph resolver are kept as fallbacks — they still
+work if LinkedIn rolls back or if the RSC endpoints are unavailable.
 
-### The normalized envelope and the URN graph
+### Why all three Voyager generations are still supported
 
-With `accept: application/vnd.linkedin.normalized+json+2.1`, responses are a graph:
+Even though the HAR shows RSC is the current transport, the three Voyager generations
+(legacy REST, dash, GraphQL) are kept in the strategy chain as fallbacks. They break at
+different times, and supporting all three means the API degrades gracefully:
+- **Flagship-web RSC** (primary) — what the live app uses now
+- **GraphQL** (fallback 1) — needs a `queryId` that rotates; highest fidelity when available
+- **Dash** (fallback 2) — needs a `decorationId`; resolves slug to URN for GraphQL
+- **Legacy REST** (fallback 3) — no queryId needed; most reliable Voyager path
+- **Public HTML** (last resort) — unauthenticated JSON-LD; always available
+
+### The normalized envelope and the URN graph (Voyager fallback path)
+
+With `accept: application/vnd.linkedin.normalized+json+2.1`, Voyager responses are a graph:
 
 ```json
 {
@@ -200,21 +216,9 @@ With `accept: application/vnd.linkedin.normalized+json+2.1`, responses are a gra
 ```
 
 `data` is a graph of URN pointers (star-keys `*foo` hold URN references); `included`
-is a flat pool of every entity. To reconstruct an object you index `included` by
-`entityUrn` and resolve references recursively.
-
-**The resolver (`app/normalize/urn_graph.py`) is the intellectual core of this
-submission.** It is pure (no I/O, no async, no config, no `app.linkedin` imports),
-which is what makes it testable offline against synthetic fixtures. It handles:
-
-- single and list URN references
-- nested references multiple levels deep
-- missing URNs (dropped from lists, `None` for singles)
-- **reference cycles** via a `seen` frozenset passed down the recursion — cycles
-  terminate by returning the raw URN string, not by recursing infinitely
-- a depth cap (`MAX_DEPTH = 12`) that returns the raw URN instead of recursing
-- a `by_type(suffix)` escape hatch that pulls every entity of a `$type` straight out
-  of `included`, for when the `data` graph doesn't lead where a mapper needs
+is a flat pool of every entity. The URN graph resolver (`app/normalize/urn_graph.py`)
+is pure (no I/O, no async) and handles cycles via a `seen` frozenset, depth caps, and
+a `by_type()` escape hatch. This is kept for the Voyager fallback path.
 
 ### Why `curl_cffi` and TLS fingerprinting
 
@@ -291,7 +295,18 @@ The orchestrator runs strategies in order: **GraphQL > dash > legacy > public-HT
 Be specific and unflinching — a reviewer who has operated one of these reads this
 section first.
 
-### GraphQL `queryId` hashes rotate
+### The RSC transport is undocumented and will change
+
+LinkedIn's flagship-web RSC (React Server Components) transport is an internal
+implementation detail, not a public API. The wire format, component IDs, and text
+layout can change with any frontend deploy. The RSC parser (`app/linkedin/rsc_parser.py`)
+and the text pattern-matching mappers (`app/linkedin/strategies/flagship_web.py`) are
+built against the format observed in the captured HAR. When LinkedIn changes the
+component layout, the mappers will need adjustment — but the parser's text-extraction
+approach is resilient to structural changes (it walks the tree, it doesn't hardcode
+paths).
+
+### GraphQL `queryId` hashes rotate (Voyager fallback path)
 
 GraphQL `queryId` values are persisted-query identifiers that rotate with LinkedIn
 frontend deploys. This *will* break the GraphQL strategy, usually every few weeks.
