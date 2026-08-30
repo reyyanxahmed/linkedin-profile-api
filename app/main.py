@@ -305,8 +305,16 @@ async def _fetch_profile(raw_url: str, refresh: bool, request: Request) -> Profi
         main_texts = primary.get("main_texts", [])
         exp_texts = primary.get("experience_texts", [])
         lang_texts = primary.get("language_texts", [])
+        about_texts = primary.get("about_texts", [])
 
-        profile = _safe_map_rsc("profile", map_profile_from_rsc, main_texts, partial)
+        # Profile mapper takes both main_texts and about_texts for the about section
+        try:
+            profile = map_profile_from_rsc(main_texts, about_texts)
+        except Exception as e:
+            get_logger("app.mapper").warning("mapper.failed", section="profile", error=str(e))
+            partial.append("profile")
+            from app.models import Profile
+            profile = Profile()
         experience = _safe_map_list_rsc("experience", map_experience_from_rsc, exp_texts, partial)
         education = _safe_map_list_rsc("education", map_education_from_rsc, main_texts, partial)
         skills: list = []

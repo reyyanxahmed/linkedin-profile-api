@@ -155,15 +155,21 @@ class FlagshipWebStrategy:
         )
         lang_texts = await _fetch_rsc_url(client, lang_url, headers, method="POST", body=exp_body)
 
-        # 4. If component POSTs failed, try the public HTML page for more data.
-        # The standard /in/{slug}/ URL returns HTML with JSON-LD that has
-        # name, headline, and sometimes experience/education.
+        # 4. About + Education section — POST (BelowActivityPart1WithoutExp)
+        # This component contains the About text and sometimes education/skills.
+        about_url = (
+            f"{FLAGSHIP_BASE}/rsc-action/actions/component"
+            f"?componentId=com.linkedin.sdui.generated.profile.dsl.impl.profileCardsBelowActivityPart1WithoutExp"
+            f"&sduiid=com.linkedin.sdui.generated.profile.dsl.impl.profileCardsBelowActivityPart1WithoutExp"
+        )
+        about_texts = await _fetch_rsc_url(client, about_url, headers, method="POST", body=exp_body)
+
+        # 5. If component POSTs failed, try the public HTML page for more data.
         if not exp_texts:
             log.info("flagship.component_post_failed_trying_html", slug=slug)
             html_url = f"https://www.linkedin.com/in/{up.quote(slug)}/"
             html_texts = await _fetch_rsc_url(client, html_url, headers, method="GET")
             if html_texts:
-                # Merge any experience-relevant texts from the HTML page.
                 exp_texts = html_texts
 
         payload = {
@@ -171,6 +177,7 @@ class FlagshipWebStrategy:
             "main_texts": main_texts,
             "experience_texts": exp_texts or [],
             "language_texts": lang_texts or [],
+            "about_texts": about_texts or [],
         }
 
         return FetchResult(payload=payload, profile_urn=profile_urn, source=self.name)
@@ -327,8 +334,12 @@ async def _fetch_rsc_url(
 
 # --- mapping functions -------------------------------------------------------
 
-def map_profile_from_rsc(texts: list[str]) -> Profile:
-    """Map the core profile fields from the main page RSC text list."""
+def map_profile_from_rsc(texts: list[str], about_texts: list[str] | None = None) -> Profile:
+    """Map the core profile fields from the main page RSC text list.
+
+    About text is extracted from a separate RSC component (about_texts) if
+    available, falling back to the main page texts.
+    """
     full_name = None
     first_name = None
     last_name = None
@@ -386,16 +397,40 @@ def map_profile_from_rsc(texts: list[str]) -> Profile:
             followers = int(m.group(1).replace(",", ""))
             break
 
-    # About: text after "About this member" header
-    for i, t in enumerate(texts):
-        if t == "About this member" or t == "About":
-            # The about text is the next long string that's not a UI element
-            for j in range(i + 1, min(i + 10, len(texts))):
-                candidate = texts[j]
-                if candidate and len(candidate) > 30 and candidate not in ("About", "About this member") and not candidate.startswith("Hire") and not candidate.startswith("Services") and not candidate.startswith("Explore"):
-                    about = candidate
-                    break
-            break
+    # About: text after "About" header — check about_texts first, then main texts
+    if not about:
+        # Try the about component first
+        if about_texts:
+            for i, t in enumerate(about_texts):
+                if isinstance(t, str) and (t == "About" or t == "About this member"):
+                    for j in range(i + 1, min(i + 10, len(about_texts))):
+                        candidate = about_texts[j]
+                        if (isinstance(candidate, str) and len(candidate) > 30
+                            and candidate not in ("About", "About this member")
+                            and not candidate.startswith("Hire")
+                            and not candidate.startswith("Services")
+                            and not candidate.startswith("Explore")
+                            and not candidate.startswith("Talent")
+                            and not candidate.startswith("Community")):
+                            about = candidate
+                            break
+                    if about:
+                        break
+        # Fallback: check main texts
+        if not about:
+            for i, t in enumerate(texts):
+                if t == "About this member" or t == "About":
+                    for j in range(i + 1, min(i + 10, len(texts))):
+                        candidate = texts[j]
+                        if (isinstance(candidate, str) and len(candidate) > 30
+                            and candidate not in ("About", "About this member")
+                            and not candidate.startswith("Hire")
+                            and not candidate.startswith("Services")
+                            and not candidate.startswith("Explore")):
+                            about = candidate
+                            break
+                    if about:
+                        break
 
     images = _map_images_from_texts(texts)
 
@@ -440,9 +475,15 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
       ("100_100/...", "200_200/...", "400_400/...")
     We reassemble these into full URLs and associate them with companies.
     """
+    # Match date ranges in multiple formats:
+    #   "Jul 2025 - Present · 1 yr 2 mos"   (Mon YYYY - Present)
+    #   "Apr 2004 - 2015 · 10 yrs 10 mos"   (Mon YYYY - YYYY)
+    #   "2015 \u2013 Present"                    (YYYY en-dash Present)
+    #   "1997 \u2013 2004"                       (YYYY en-dash YYYY)
+    #   "Jan 2025 - Jul 2025 · 7 mos"       (Mon YYYY - Mon YYYY)
     DATE_RE = re.compile(
-        r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}\s*[-\u2013]\s*"
-        r"(?:Present|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})"
+        r"^(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+)?\d{4}\s*[-\u2013]\s*"
+        r"(?:Present|(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+)?\d{4})"
         r"(?:\s*[·•]\s*(\d+\s+yr[s]?\s+\d+\s+mos?|\d+\s+mos?|\d+\s+yr[s]?))?"
     )
     YEAR_RANGE_RE = re.compile(r"^\d{4}\s*[-\u2013]\s*\d{4}$")
@@ -452,11 +493,10 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
     LOCATION_RE = re.compile(r"^[A-Z][a-zA-Z\s]+,\s[A-Z][a-zA-Z\s]+")
     SKILLS_RE = re.compile(r".*\+\d+ skills$")
 
-    # Pre-extract company logos from the text list. Logos appear as:
-    #   "CompanyName logo" -> base_url -> "100_100/..." -> "200_200/..." -> "400_400/..."
+    positions: list[Experience] = []
+    # Pre-extract company logos
     company_logos = _extract_company_logos(texts)
 
-    positions: list[Experience] = []
     i = 0
     while i < len(texts):
         t = texts[i]
@@ -475,6 +515,7 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
 
             j = i - 1
 
+            # Handle "Company · Type" composite
             if j >= 0 and " · " in (texts[j] or ""):
                 parts = texts[j].split(" · ")
                 if len(parts) == 2 and parts[1] in EMPLOYMENT_TYPES:
@@ -485,7 +526,13 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
                         title = texts[j]
                         j -= 1
             else:
+                # Walk backwards from date. The text immediately before is:
+                # - the title (Layout B: title, company, date — but wait, that's
+                #   company before date, title before company)
+                # - or just the title (Layout C: company, duration, title, date)
+                # - or employment_type (Layout A: ..., title, emp_type, date)
                 if j >= 0 and texts[j] in EMPLOYMENT_TYPES:
+                    # Layout A: emp_type
                     employment_type = texts[j]
                     j -= 1
                     if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
@@ -501,13 +548,37 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
                         if candidate and not candidate.endswith(" logo") and not candidate.startswith("http"):
                             company_name = candidate
                 else:
+                    # No employment_type before the date. Two layouts:
+                    #   Layout B: title, company, date (barackobama)
+                    #   Layout C: company, duration, title, date (sundarpichai)
+                    # The text immediately before the date is:
+                    #   - company (Layout B)
+                    #   - title (Layout C)
+                    # We distinguish by checking if there's a duration string
+                    # between the two texts before the date (Layout C has one).
                     if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
-                        company_name = texts[j]
+                        first_before = texts[j]
                         j -= 1
-                    if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
-                        candidate = texts[j]
-                        if candidate and not candidate.endswith(" logo") and not candidate.startswith("http"):
-                            title = candidate
+                        # Check if the next text back is a duration string
+                        has_duration = j >= 0 and bool(DURATION_RE.match(texts[j] or ""))
+                        if has_duration:
+                            # Layout C: company, duration, title, date
+                            # first_before = title, skip duration, then company
+                            title = first_before
+                            while j >= 0 and (DURATION_RE.match(texts[j] or "") or SKILLS_RE.match(texts[j] or "")):
+                                j -= 1
+                            if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
+                                candidate = texts[j]
+                                if candidate and not candidate.endswith(" logo") and not candidate.startswith("http"):
+                                    company_name = candidate
+                        else:
+                            # Layout B: title, company, date
+                            # first_before = company, second_before = title
+                            company_name = first_before
+                            if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
+                                candidate = texts[j]
+                                if candidate and not candidate.endswith(" logo") and not candidate.startswith("http"):
+                                    title = candidate
 
             k = i + 1
             if k < len(texts) and texts[k] in LOCATION_TYPES:
@@ -523,12 +594,10 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
 
             start, end, is_current = _parse_date_range(date_str)
 
-            # Look up logo for this company
             logo_url = None
             if company_name:
                 logo_url = company_logos.get(company_name.strip())
                 if not logo_url and company_name.strip():
-                    # Try case-insensitive match
                     for cn, lu in company_logos.items():
                         if cn.lower() == company_name.strip().lower():
                             logo_url = lu
@@ -636,15 +705,22 @@ def _parse_date_range(date_str: str) -> tuple[dict | None, dict | None, bool]:
 
 
 def _parse_month_year(s: str, months: dict) -> dict | None:
-    """Parse 'Jul 2025' into {'year': 2025, 'month': 7, 'day': None, 'iso': '2025-07'}."""
+    """Parse 'Jul 2025' or '2015' into {'year': Y, 'month': M|None, 'day': None, 'iso': str}.
+
+    For year-only dates, month is None and iso is just the year.
+    """
     m = re.match(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})$", s.strip())
-    if not m:
-        return None
-    month = months.get(m.group(1))
-    year = int(m.group(2))
-    if not month:
-        return None
-    return {"year": year, "month": month, "day": None, "iso": f"{year:04d}-{month:02d}"}
+    if m:
+        month = months.get(m.group(1))
+        year = int(m.group(2))
+        if month:
+            return {"year": year, "month": month, "day": None, "iso": f"{year:04d}-{month:02d}"}
+    # Year-only
+    m = re.match(r"^(\d{4})$", s.strip())
+    if m:
+        year = int(m.group(1))
+        return {"year": year, "month": None, "day": None, "iso": f"{year:04d}"}
+    return None
 
 
 def _parse_duration_months(date_str: str) -> int | None:
