@@ -358,9 +358,9 @@ function renderProfile(d) {
 
   return `
   <div class="profile">
-    <div class="cover">${bimg ? `<img src="${esc(bimg)}" alt="">` : ''}</div>
+    <div class="cover">${bimg ? `<img src="${imgProxy(bimg)}" alt="">` : ''}</div>
     <div class="pheader">
-      <div class="avatar">${pimg ? `<img src="${esc(pimg)}" alt="">` : `<div class="avatar-fb">${esc(inits(p.full_name))}</div>`}</div>
+      <div class="avatar">${pimg ? `<img src="${imgProxy(pimg)}" alt="">` : `<div class="avatar-fb">${esc(inits(p.full_name))}</div>`}</div>
       <div class="pname">${esc(p.full_name || 'Unknown')}</div>
       ${p.headline ? `<div class="phline">${esc(p.headline)}</div>` : ''}
       <div class="pmeta">
@@ -400,7 +400,7 @@ function renderExp(exp) {
       const dates = fmtDates(e.start, e.end, e.is_current);
       const dur = e.duration_months ? fmtDur(e.duration_months) : '';
       return `<div class="exp">
-        <div class="exp-logo">${logo ? `<img src="${esc(logo)}" alt="">` : `<div class="exp-logo-fb">${esc(inits(co))}</div>`}</div>
+        <div class="exp-logo">${logo ? `<img src="${imgProxy(logo)}" alt="">` : `<div class="exp-logo-fb">${esc(inits(co))}</div>`}</div>
         <div class="exp-body">
           <div class="exp-title">${esc(e.title||'')}</div>
           ${co ? `<div class="exp-co">${esc(co)}${e.company?.linkedin_url?` · <a href="${esc(e.company.linkedin_url)}" target="_blank">View</a>`:''}</div>`:''}
@@ -456,6 +456,12 @@ function renderSec(title, html) {
 function esc(s) {
   if (s == null) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function imgProxy(url) {
+  if (!url) return '';
+  if (url.startsWith('https://media.licdn.com/')) return '/v1/img?url=' + encodeURIComponent(url);
+  return url;
 }
 
 function inits(name) {

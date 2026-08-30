@@ -26,7 +26,7 @@ from pathlib import Path
 import orjson
 from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel as PydanticBaseModel
 
 from app.cache import ProfileCache
@@ -144,6 +144,30 @@ async def serve_website() -> HTMLResponse:
             f"const API_KEY = {orjson.dumps(settings.api_key).decode()};",
         )
     return HTMLResponse(content=html)
+
+
+# --- image proxy (for LinkedIn CDN images that check Referer) ----------------
+
+@app.get("/v1/img", include_in_schema=False)
+async def proxy_image(url: str) -> Response:
+    """Proxy a LinkedIn CDN image so the browser can load it.
+
+    LinkedIn's media CDN images are signed and time-limited but load fine
+    server-side. In the browser, they may be blocked by Referer policy.
+    This endpoint fetches the image server-side and streams it back, so the
+    browser sees a same-origin image with no CORS/Referer issues.
+    """
+    from curl_cffi.requests import AsyncSession
+
+    if not url.startswith("https://media.licdn.com/"):
+        return JSONResponse(status_code=400, content={"error": "only media.licdn.com URLs allowed"})
+    try:
+        client = AsyncSession(impersonate="chrome124")
+        resp = await client.get(url, headers={"Referer": "https://www.linkedin.com/"})
+        content_type = resp.headers.get("content-type", "image/jpeg")
+        return Response(content=resp.content, media_type=content_type)
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": f"image fetch failed: {e}"})
 
 
 # --- middleware (request id) -------------------------------------------------
