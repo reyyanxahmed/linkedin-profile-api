@@ -329,8 +329,6 @@ async def _fetch_rsc_url(
 
 def map_profile_from_rsc(texts: list[str]) -> Profile:
     """Map the core profile fields from the main page RSC text list."""
-    # Name: the first occurrence of a "First Last" pattern after "Primary content"
-    # or the title "Name | LinkedIn"
     full_name = None
     first_name = None
     last_name = None
@@ -339,23 +337,19 @@ def map_profile_from_rsc(texts: list[str]) -> Profile:
     industry = None
     about = None
     profile_urn = None
+    followers = None
 
     for i, t in enumerate(texts):
-        # Profile URN
         if not profile_urn and t.startswith("ACoAA"):
             profile_urn = t
 
-        # Title tag: "Name | LinkedIn"
         if "| LinkedIn" in t and full_name is None:
             full_name = t.replace(" | LinkedIn", "").strip()
 
-        # Headline: appears after the name in the topcard, often before "Send profile"
         if full_name and not headline and "Send profile" in t:
-            # The headline is the text just before "Send profile in a message"
             if i > 0 and texts[i - 1] and len(texts[i - 1]) > 5 and "LinkedIn" not in texts[i - 1]:
                 headline = texts[i - 1]
 
-    # Fallback: look for name after "Primary content"
     if not full_name:
         for i, t in enumerate(texts):
             if t == "Primary content" and i + 1 < len(texts):
@@ -369,24 +363,44 @@ def map_profile_from_rsc(texts: list[str]) -> Profile:
         first_name = parts[0] if parts else None
         last_name = parts[1] if len(parts) > 1 else None
 
-    # Location: look for a pattern like "City, Region, Country"
+    # Location: "City, Region, Country" or just "Country"
     for t in texts:
-        if not location_raw and re.match(r"^[A-Z][a-zA-Z\s]+,\s[A-Z][a-zA-Z\s]+,\s[A-Z]", t):
-            location_raw = t
+        if not location_raw:
+            # Full "City, Region, Country" pattern
+            if re.match(r"^[A-Z][a-zA-Z\s]+,\s[A-Z][a-zA-Z\s]+,\s[A-Z]", t):
+                location_raw = t
+                break
+    # Fallback: single-word country after the education/company summary
+    if not location_raw:
+        for i, t in enumerate(texts):
+            if " · " in t and i + 1 < len(texts):
+                candidate = texts[i + 1]
+                if candidate and len(candidate) < 30 and re.match(r"^[A-Z][a-z]+$|^[A-Z][a-z]+ [A-Z][a-z]+$", candidate):
+                    location_raw = candidate
+                    break
+
+    # Followers: "4,294 followers" pattern
+    for t in texts:
+        m = re.match(r"^([\d,]+)\s+followers$", t)
+        if m:
+            followers = int(m.group(1).replace(",", ""))
             break
 
-    # Education + company summary: "Company · School" pattern
-    education_school = None
-    for t in texts:
-        if " · " in t and not education_school:
-            parts = t.split(" · ")
-            if len(parts) == 2:
-                education_school = parts[1].strip()
+    # About: text after "About this member" header
+    for i, t in enumerate(texts):
+        if t == "About this member" or t == "About":
+            # The about text is the next long string that's not a UI element
+            for j in range(i + 1, min(i + 10, len(texts))):
+                candidate = texts[j]
+                if candidate and len(candidate) > 30 and candidate not in ("About", "About this member") and not candidate.startswith("Hire") and not candidate.startswith("Services") and not candidate.startswith("Explore"):
+                    about = candidate
+                    break
+            break
 
-    # Images: find profile photo and cover photo URLs
     images = _map_images_from_texts(texts)
 
     loc = Location(raw=location_raw) if location_raw else None
+    counts = Counts(followers=followers)
 
     return Profile(
         first_name=first_name,
@@ -399,7 +413,7 @@ def map_profile_from_rsc(texts: list[str]) -> Profile:
         pronouns=None,
         flags=ProfileFlags(),
         images=images,
-        counts=Counts(),
+        counts=counts,
     )
 
 
@@ -642,22 +656,44 @@ def map_languages_from_rsc(texts: list[str]) -> list[Language]:
 
 
 def _map_images_from_texts(texts: list[str]) -> ProfileImages:
-    """Extract profile photo and background photo URLs from the main page texts."""
+    """Extract profile photo and background photo URLs from the main page texts.
+
+    LinkedIn's RSC stream contains multiple URL fragments for each image. We want
+    the full URLs with resolution info (shrink_NNN or scale_NNN), not the truncated
+    base URLs. For srcset strings ("url 100w, url 200w"), we take the first URL.
+    """
     profile_imgs: list[Image] = []
     bg_imgs: list[Image] = []
 
-    in_profile_photo = False
     for t in texts:
-        if t == "Profile photo":
-            in_profile_photo = True
+        if not isinstance(t, str) or not t.startswith("https://media.licdn.com/dms/image"):
             continue
-        if t == "Cover photo":
-            in_profile_photo = False
-            continue
-        if t.startswith("https://media.licdn.com/dms/image") and "profile-displayphoto" in t:
-            if in_profile_photo or not bg_imgs:
-                profile_imgs.append(Image(url=t, expires_at=parse_image_expiry(t)))
-        elif t.startswith("https://media.licdn.com/dms/image") and "profile-displaybackgroundimage" in t:
-            bg_imgs.append(Image(url=t, expires_at=parse_image_expiry(t)))
+        # For srcset strings, take only the first URL (before the space+w)
+        url = t.split(" ")[0]
+
+        if "profile-displayphoto" in url and ("shrink_" in url or "scale_" in url):
+            if not profile_imgs or _img_res(url) > _img_res(profile_imgs[0].url):
+                profile_imgs = [Image(url=url, expires_at=parse_image_expiry(url))]
+        elif "profile-displayphoto" in url and not profile_imgs:
+            profile_imgs = [Image(url=url, expires_at=parse_image_expiry(url))]
+
+        if "profile-displaybackgroundimage" in url and ("shrink_" in url or "scale_" in url):
+            if not bg_imgs or _img_res(url) > _img_res(bg_imgs[0].url):
+                bg_imgs = [Image(url=url, expires_at=parse_image_expiry(url))]
+        elif "profile-displaybackgroundimage" in url and not bg_imgs:
+            bg_imgs = [Image(url=url, expires_at=parse_image_expiry(url))]
 
     return ProfileImages(profile=profile_imgs, background=bg_imgs)
+
+
+def _img_res(url: str) -> int:
+    """Extract the resolution number from a LinkedIn image URL for comparison."""
+    import re
+
+    m = re.search(r"shrink_(\d+)_(\d+)", url)
+    if m:
+        return int(m.group(1)) * int(m.group(2))
+    m = re.search(r"scale_(\d+)_(\d+)", url)
+    if m:
+        return int(m.group(1)) * int(m.group(2))
+    return 0
