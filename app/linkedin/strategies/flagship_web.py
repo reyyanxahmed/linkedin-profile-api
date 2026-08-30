@@ -435,11 +435,10 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
       Layout A: company, duration, location, title, emp_type, date
       Layout B: title, company, date
 
-    Both share the invariant that the date is the anchor, and the two texts
-    immediately before it are (company, title) in some order. We heuristically
-    detect which is which: if one of them is a known employment type, it's the
-    emp_type (Layout A); otherwise the one closer to the date is the company
-    (Layout B) and the one further is the title (Layout A: reversed).
+    Company logos appear after all positions, as fragments:
+      base_url (e.g. "...company-logo_") followed by resolution paths
+      ("100_100/...", "200_200/...", "400_400/...")
+    We reassemble these into full URLs and associate them with companies.
     """
     DATE_RE = re.compile(
         r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}\s*[-\u2013]\s*"
@@ -453,13 +452,16 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
     LOCATION_RE = re.compile(r"^[A-Z][a-zA-Z\s]+,\s[A-Z][a-zA-Z\s]+")
     SKILLS_RE = re.compile(r".*\+\d+ skills$")
 
+    # Pre-extract company logos from the text list. Logos appear as:
+    #   "CompanyName logo" -> base_url -> "100_100/..." -> "200_200/..." -> "400_400/..."
+    company_logos = _extract_company_logos(texts)
+
     positions: list[Experience] = []
     i = 0
     while i < len(texts):
         t = texts[i]
         date_match = DATE_RE.match(t)
         if not date_match:
-            # Also match year-only ranges: "1997 \u2013 2004"
             year_match = YEAR_RANGE_RE.match(t)
             if year_match:
                 date_match = year_match
@@ -471,12 +473,8 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
             location_type = None
             date_str = t
 
-            # Walk backwards from the date. The texts before it are, in reverse
-            # order: either [company, title, ...] (Layout B) or
-            # [emp_type, title, location, duration, company, ...] (Layout A).
             j = i - 1
 
-            # First, check for the "Company · Type" composite (e.g. "BDO · Internship").
             if j >= 0 and " · " in (texts[j] or ""):
                 parts = texts[j].split(" · ")
                 if len(parts) == 2 and parts[1] in EMPLOYMENT_TYPES:
@@ -487,11 +485,7 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
                         title = texts[j]
                         j -= 1
             else:
-                # The text immediately before the date is either:
-                # - the company name (Layout B: title, company, date)
-                # - the employment_type (Layout A: ..., title, emp_type, date)
                 if j >= 0 and texts[j] in EMPLOYMENT_TYPES:
-                    # Layout A: emp_type, then title, then maybe location, then company
                     employment_type = texts[j]
                     j -= 1
                     if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
@@ -507,8 +501,6 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
                         if candidate and not candidate.endswith(" logo") and not candidate.startswith("http"):
                             company_name = candidate
                 else:
-                    # Layout B: title, company, date
-                    # texts[j] = company, texts[j-1] = title
                     if j >= 0 and not DATE_RE.match(texts[j] or "") and texts[j] not in LOCATION_TYPES:
                         company_name = texts[j]
                         j -= 1
@@ -517,12 +509,10 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
                         if candidate and not candidate.endswith(" logo") and not candidate.startswith("http"):
                             title = candidate
 
-            # Walk forwards: location_type may follow the date
             k = i + 1
             if k < len(texts) and texts[k] in LOCATION_TYPES:
                 location_type = texts[k]
 
-            # If location not found backwards, check "City · LocationType" pattern
             if not location and k < len(texts):
                 nxt = texts[k] if k < len(texts) else ""
                 if nxt and " · " in nxt:
@@ -533,10 +523,21 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
 
             start, end, is_current = _parse_date_range(date_str)
 
+            # Look up logo for this company
+            logo_url = None
+            if company_name:
+                logo_url = company_logos.get(company_name.strip())
+                if not logo_url and company_name.strip():
+                    # Try case-insensitive match
+                    for cn, lu in company_logos.items():
+                        if cn.lower() == company_name.strip().lower():
+                            logo_url = lu
+                            break
+
             positions.append(Experience(
                 title=title,
                 employment_type=employment_type,
-                company=CompanyRef(name=company_name) if company_name else None,
+                company=CompanyRef(name=company_name, logo=logo_url) if company_name else None,
                 location=location,
                 location_type=location_type,
                 start=DatePart(**start) if start else None,
@@ -548,6 +549,68 @@ def map_experience_from_rsc(texts: list[str]) -> list[Experience]:
             ))
         i += 1
     return positions
+
+
+def _extract_company_logos(texts: list[str]) -> dict[str, str]:
+    """Extract company logo URLs from the RSC text list.
+
+    Logos appear as fragments in the text:
+      "CompanyName logo"  -> label
+      "https://media.licdn.com/.../company-logo_"  -> base URL (truncated)
+      "100_100/B56Z.../...?e=...&t=..."  -> resolution path 1
+      "200_200/B56Z.../...?e=...&t=..."  -> resolution path 2
+      "400_400/B56Z.../...?e=...&t=..."  -> resolution path 3
+
+    We reconstruct full URLs by concatenating the base URL with the highest-
+    resolution path, and associate them with the company name from the label.
+    """
+    logos: dict[str, str] = {}
+    i = 0
+    while i < len(texts):
+        t = texts[i]
+        # Look for "CompanyName logo" label
+        if isinstance(t, str) and t.endswith(" logo") and not t.startswith("http"):
+            company_name = t[:-5].strip()  # Remove " logo" suffix
+            # Look ahead for the base URL and resolution paths
+            base_url = None
+            best_url = None
+            j = i + 1
+            while j < len(texts) and j < i + 10:
+                candidate = texts[j]
+                if not isinstance(candidate, str):
+                    j += 1
+                    continue
+                if candidate.startswith("https://media.licdn.com/") and "company-logo" in candidate:
+                    if not base_url:
+                        base_url = candidate
+                elif base_url and re.match(r"^\d+_\d+/", candidate):
+                    # Resolution path — concatenate with base URL
+                    full_url = base_url + candidate
+                    # Pick the highest resolution
+                    m = re.match(r"^(\d+)_(\d+)/", candidate)
+                    if m:
+                        res = int(m.group(1)) * int(m.group(2))
+                        if not best_url or res > _img_res(best_url):
+                            best_url = full_url
+                elif base_url and candidate.startswith("http"):
+                    # Full URL (not a fragment)
+                    if "company-logo" in candidate and ("shrink_" in candidate or "100_100" in candidate):
+                        if not best_url:
+                            best_url = candidate.split(" ")[0]
+                    break
+                elif not candidate.startswith("http") and not re.match(r"^\d+_\d+/", candidate):
+                    # Not a URL fragment — done with this company
+                    break
+                j += 1
+
+            if best_url:
+                logos[company_name] = best_url
+            elif base_url:
+                logos[company_name] = base_url
+            i = j
+        else:
+            i += 1
+    return logos
 
 
 def _parse_date_range(date_str: str) -> tuple[dict | None, dict | None, bool]:
