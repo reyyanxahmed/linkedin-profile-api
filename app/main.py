@@ -440,6 +440,39 @@ async def _fetch_profile(raw_url: str, refresh: bool, request: Request) -> Profi
         # Voyager gives us structured experience/education/skills/etc., but
         # may lack photos, followers, and about text that the flagship has.
         flagship_texts = primary.get("_flagship_main_texts", []) if isinstance(primary, dict) else []
+        card_texts = primary.get("_flagship_card_texts", []) if isinstance(primary, dict) else []
+
+        # Sections Voyager cannot serve at all — its skills and educations
+        # sub-resources are 410 Gone — are filled from the flagship card text.
+        # Additive only: a section Voyager did populate is never overwritten.
+        if card_texts:
+            from app.linkedin.strategies.flagship_web import (
+                map_certifications_from_rsc,
+                map_education_from_rsc,
+                map_languages_from_rsc,
+                texts_for_section,
+            )
+            rsc_payload = {
+                "card_texts": card_texts,
+                "component_texts": primary.get("_flagship_component_texts", {})
+                if isinstance(primary, dict) else {},
+            }
+            if not education:
+                education = _safe_map_list_rsc(
+                    "education", map_education_from_rsc,
+                    texts_for_section(rsc_payload, "education"), partial,
+                )
+            if not certifications:
+                certifications = _safe_map_list_rsc(
+                    "certifications", map_certifications_from_rsc,
+                    texts_for_section(rsc_payload, "certifications"), partial,
+                )
+            if not languages:
+                languages = _safe_map_list_rsc(
+                    "languages", map_languages_from_rsc,
+                    texts_for_section(rsc_payload, "languages"), partial,
+                )
+
         if flagship_texts and not profile.images.profile:
             from app.linkedin.strategies.flagship_web import (
                 map_profile_from_rsc,

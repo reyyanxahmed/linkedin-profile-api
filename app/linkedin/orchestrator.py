@@ -155,6 +155,16 @@ class Orchestrator:
             if isinstance(primary.payload, dict):
                 primary.payload["_flagship_main_texts"] = flagship_result.payload.get("main_texts", [])
                 primary.payload["_flagship_about_texts"] = flagship_result.payload.get("about_texts", [])
+                # Card text carries the sections Voyager physically cannot serve:
+                # its skills and educations sub-resources are 410 Gone. Without
+                # this the merged result reports them empty even when the flagship
+                # strategy fetched them successfully.
+                primary.payload["_flagship_card_texts"] = flagship_result.payload.get(
+                    "card_texts", []
+                )
+                primary.payload["_flagship_component_texts"] = flagship_result.payload.get(
+                    "component_texts", {}
+                )
         elif voyager_result:
             primary = voyager_result
             primary_strategy = next(s for s in self.strategies if isinstance(s, LegacyStrategy))

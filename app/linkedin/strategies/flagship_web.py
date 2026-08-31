@@ -256,6 +256,11 @@ class FlagshipWebStrategy:
             "language_texts": card_texts,
             "about_texts": card_texts,
             "card_texts": card_texts,
+            # Per-component text, so a mapper can scope itself to the card that
+            # actually holds its section. Pooling every card together is too coarse:
+            # a board role rendered as "2016 - 2022" is indistinguishable from a
+            # degree's date range, so education picks up jobs.
+            "component_texts": section_texts,
             "components": {k: len(v) for k, v in section_texts.items()},
         }
 
@@ -269,6 +274,34 @@ def _tracking_id() -> str:
 
 def _hex_id(n_bytes: int) -> str:
     return os.urandom(n_bytes).hex()
+
+
+SECTION_HEADERS = {
+    "education": "Education",
+    "certifications": "Licenses & certifications",
+    "languages": "Languages",
+    "skills": "Skills",
+}
+
+
+def texts_for_section(payload: dict, section: str) -> list[str]:
+    """Text of the card(s) that actually contain `section`, else the pooled text.
+
+    Which "BelowActivityPartN" bucket holds a section is not stable across profiles,
+    so the card is identified by the section header it renders rather than by name.
+    Scoping matters: pooled across every card, a year-only job date ("2016 - 2022")
+    is indistinguishable from a degree's date range.
+    """
+    header = SECTION_HEADERS.get(section)
+    components = payload.get("component_texts") or {}
+    if header and isinstance(components, dict):
+        scoped: list[str] = []
+        for texts in components.values():
+            if any(isinstance(x, str) and x.strip() == header for x in texts):
+                scoped.extend(texts)
+        if scoped:
+            return scoped
+    return payload.get("card_texts") or []
 
 
 def _build_browser_headers(
@@ -968,6 +1001,11 @@ _NOISE_EXACT = {
     "Verified", "Follow", "Following", "Join", "Joined", "Requested", "Subscribe",
     "Subscribed", "Unsubscribed", "Pending", "Received", "Given", "Post",
     "carousel-child-container", "Nothing to see for now",
+    # Section headers. They sit immediately above the first entry of their card,
+    # so without this the header itself is read as the first school or employer.
+    "Education", "Experience", "Licenses & certifications", "Languages", "Skills",
+    "Honors & awards", "Test scores", "Recommendations", "Projects", "Courses",
+    "Volunteering", "Publications", "Patents", "Organizations", "Featured", "About",
 }
 _NOISE_SUFFIXES = ("-count", " logo")
 

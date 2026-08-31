@@ -192,3 +192,40 @@ class TestLocationAttribution:
         by_title = {e.title: e.location for e in map_experience_from_rsc(texts)}
         assert by_title["Software Engineer III"] == "Bengaluru, Karnataka, India"
         assert by_title["Educator"] == "India"
+
+
+class TestSectionScoping:
+    """Card mappers must scope to the card holding their section.
+
+    Pooled across every card, a year-only job range ("2016 - 2022") is
+    indistinguishable from a degree's date range, so education picks up board
+    seats. Caught live on a profile whose board roles are year-only.
+    """
+
+    def test_texts_for_section_picks_the_right_card(self) -> None:
+        from app.linkedin.strategies.flagship_web import texts_for_section
+
+        payload = {
+            "component_texts": {
+                "cardA": ["Experience", "Board Member", "Acme", "2016 – 2022"],
+                "cardB": ["Education", "Some University", "BSc, Physics", "2010 – 2014"],
+            },
+            "card_texts": ["everything", "pooled"],
+        }
+        got = texts_for_section(payload, "education")
+        assert "Some University" in got
+        assert "Board Member" not in got
+
+    def test_falls_back_to_pooled_when_header_absent(self) -> None:
+        from app.linkedin.strategies.flagship_web import texts_for_section
+
+        payload = {"component_texts": {"cardA": ["nothing"]}, "card_texts": ["pooled"]}
+        assert texts_for_section(payload, "education") == ["pooled"]
+
+    def test_section_header_is_not_read_as_an_entry(self) -> None:
+        """The header sits directly above the first entry of its card."""
+        texts = ["Education", "The University of Chicago", "1994 – 1996"]
+        got = map_education_from_rsc(texts)
+        assert len(got) == 1
+        assert got[0].school == "The University of Chicago"
+        assert got[0].degree is None
