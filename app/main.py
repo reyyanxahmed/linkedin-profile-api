@@ -192,12 +192,20 @@ async def request_id_middleware(request: Request, call_next):  # type: ignore[no
 # --- auth --------------------------------------------------------------------
 
 def _check_api_key(x_api_key: str | None) -> None:
-    """Constant-time API key check. Missing or wrong -> 401."""
-    if not settings.has_api_key:
-        # No key configured: fail closed. Document in /health.
-        raise UnauthorizedError("server has no API key configured; set API_KEY env var")
-    if not x_api_key or not hmac.compare_digest(x_api_key, settings.api_key):
-        raise UnauthorizedError("missing or invalid X-API-Key header")
+    """Constant-time API key check. Missing or wrong -> 401.
+
+    Precedence is deliberate: a configured API_KEY is ALWAYS enforced, so
+    ALLOW_UNAUTHENTICATED can never silently disable a key someone set. Only when no
+    key exists does the flag decide between open access and failing closed.
+    """
+    if settings.has_api_key:
+        if not x_api_key or not hmac.compare_digest(x_api_key, settings.api_key):
+            raise UnauthorizedError("missing or invalid X-API-Key header")
+        return
+    if settings.allow_unauthenticated:
+        return
+    # No key configured and not explicitly opened: fail closed. Shown in /v1/health.
+    raise UnauthorizedError("server has no API key configured; set API_KEY env var")
 
 
 # --- exception handlers ------------------------------------------------------
@@ -234,6 +242,9 @@ async def health() -> dict:
         "sessions": pool.health(),
         # The backend actually in use, not merely what was configured.
         "cache": app.state.cache.backend,
+        # "api_key" | "open" — how /v1/profile is gated right now.
+        "auth": "api_key" if settings.has_api_key
+                else ("open" if settings.allow_unauthenticated else "closed"),
         "has_api_key": settings.has_api_key,
     }
 

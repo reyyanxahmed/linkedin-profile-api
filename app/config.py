@@ -102,7 +102,10 @@ class Settings(BaseSettings):
 
     api_key: str = Field(default="", alias="API_KEY")
     li_sessions_raw: str = Field(default="", alias="LI_SESSIONS")
-    redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
+    # Empty by default: no Redis attempt unless one is actually configured. A
+    # localhost default costs a connect-timeout on every cold start of a serverless
+    # deployment that has no Redis, for a cache that then falls back to memory anyway.
+    redis_url: str = Field(default="", alias="REDIS_URL")
     cache_ttl_seconds: int = Field(default=86400, alias="CACHE_TTL_SECONDS")
     impersonate: str = Field(default="chrome150", alias="IMPERSONATE")
     min_delay_ms: int = Field(default=800, alias="MIN_DELAY_MS")
@@ -117,6 +120,11 @@ class Settings(BaseSettings):
     # value in LI_SESSIONS goes stale; this file holds the current one across
     # restarts. Contains credentials — gitignored, written 0600. Blank disables it.
     cookie_state_path: str = Field(default=".cookie_state.json", alias="COOKIE_STATE_PATH")
+    # Serve /v1/profile without an X-API-Key. Off by default: with no API_KEY set the
+    # API fails closed, which is the right default for a credentialed scraper. The
+    # public demo deployment turns this ON deliberately so reviewers can exercise the
+    # API from a browser. Setting API_KEY always re-enables enforcement, even here.
+    allow_unauthenticated: bool = Field(default=False, alias="ALLOW_UNAUTHENTICATED")
 
     @field_validator("li_sessions_raw")
     @classmethod

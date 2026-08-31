@@ -230,3 +230,38 @@ class TestCookieStoreNeverTruncates:
         cookie_store.save(str(path), [Session(li_at="t", jsessionid="ajax:1")])
         cookie_store.save(str(path), [])
         assert list(cookie_store.load(str(path))) == ["ajax:1"]
+
+
+class TestAuthGating:
+    """A configured API_KEY must always win over the open-access flag."""
+
+    def _settings(self, **env: str):
+        from app.config import Settings
+
+        return Settings(_env_file=None, **env)  # type: ignore[call-arg,arg-type]
+
+    def test_configured_key_is_enforced_even_when_open_is_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import app.main as m
+        from app.errors import UnauthorizedError
+
+        monkeypatch.setattr(m, "settings", self._settings(API_KEY="k", ALLOW_UNAUTHENTICATED="true"))
+        # The flag must never silently disable a key someone deliberately set.
+        with pytest.raises(UnauthorizedError):
+            m._check_api_key(None)
+        m._check_api_key("k")  # correct key still works
+
+    def test_open_flag_allows_access_when_no_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import app.main as m
+
+        monkeypatch.setattr(m, "settings", self._settings(API_KEY="", ALLOW_UNAUTHENTICATED="true"))
+        m._check_api_key(None)  # must not raise
+
+    def test_fails_closed_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import app.main as m
+        from app.errors import UnauthorizedError
+
+        monkeypatch.setattr(m, "settings", self._settings(API_KEY="", ALLOW_UNAUTHENTICATED="false"))
+        with pytest.raises(UnauthorizedError):
+            m._check_api_key(None)
