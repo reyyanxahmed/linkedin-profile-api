@@ -308,3 +308,40 @@ class TestChallengeCookiePoisoning:
         assert "trkCode" not in names and "trkInfo" not in names and "rtc" not in names
         # The legitimate rotation still lands.
         assert s.li_at == "rotated"
+
+
+class TestCollectionMetadataIsolation:
+    """A dash collection wrapper must not leak into the merged data root.
+
+    A dash query answers with {entityUrn, paging, *elements} describing the QUERY,
+    and `*elements` there points at the profile itself. Merged to the data root it
+    collides with the experience mapper's `elements` key, which then emits the
+    Profile entity as a position — one empty job carrying the profile's country as
+    its location. Caught against a real live payload.
+    """
+
+    def test_wrapper_keys_are_dropped(self) -> None:
+        from app.linkedin.strategies.legacy import _merge_envelopes
+
+        dash = {
+            "data": {
+                "entityUrn": "urn:li:collectionResponse:abc",
+                "paging": {"count": 10},
+                "*elements": ["urn:li:fsd_profile:XYZ"],
+                "$type": "com.linkedin.restli.common.CollectionResponse",
+            },
+            "included": [{"$type": "com.linkedin.voyager.identity.profile.Profile"}],
+        }
+        merged = _merge_envelopes(dash, None, {})
+        assert "elements" not in merged["data"]
+        assert "*elements" not in merged["data"]
+        assert "paging" not in merged["data"]
+        # The entities themselves must survive.
+        assert len(merged["included"]) == 1
+
+    def test_real_section_data_survives(self) -> None:
+        from app.linkedin.strategies.legacy import _merge_envelopes
+
+        dash = {"data": {"entityUrn": "x", "firstName": "Ada"}, "included": []}
+        merged = _merge_envelopes(dash, None, {})
+        assert merged["data"]["firstName"] == "Ada"
