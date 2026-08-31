@@ -126,10 +126,42 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
 
 app = FastAPI(
     title="LinkedIn Profile API",
-    description="HTTP API that returns a LinkedIn profile as structured JSON by hitting "
-                "LinkedIn's Voyager endpoints directly. No browser in the runtime.",
+    description=(
+        "Takes a LinkedIn profile URL and returns the profile as structured JSON.\n\n"
+        "Built by hitting LinkedIn's internal endpoints directly over HTTP — a purely "
+        "reverse-engineered solution with **no browser anywhere in the runtime**. "
+        "Transport is `curl_cffi`, which reproduces Chrome's TLS/JA3 handshake at the "
+        "libcurl level.\n\n"
+        "### Quick start\n\n"
+        "Call `GET /v1/profile` with a profile URL:\n\n"
+        "```\n"
+        "/v1/profile?url=https://www.linkedin.com/in/satyanadella/\n"
+        "```\n\n"
+        "Every section is always present in the response (empty rather than absent), so "
+        "callers never branch on key existence. `meta.completeness` and "
+        "`meta.partial_sections` make partial results legible instead of silent.\n\n"
+        "### Notes\n\n"
+        "- Responses are cached; pass `refresh=true` to bypass.\n"
+        "- `X-API-Key` is required only when the deployment sets `API_KEY`. "
+        "Check `GET /v1/health` \u2192 `auth` to see which mode is active.\n"
+        "- Source and full write-up: "
+        "[github.com/reyyanxahmed/linkedin-profile-api]"
+        "(https://github.com/reyyanxahmed/linkedin-profile-api)"
+    ),
     version=APP_VERSION,
     lifespan=lifespan,
+    # Tag order drives the order of sections in /docs. The profile endpoints are the
+    # product; health is diagnostics and belongs underneath them.
+    openapi_tags=[
+        {
+            "name": "profile",
+            "description": "Fetch a LinkedIn profile as structured JSON.",
+        },
+        {
+            "name": "meta",
+            "description": "Service diagnostics. Safe to call unauthenticated.",
+        },
+    ],
 )
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -232,7 +264,15 @@ async def validation_handler(request: Request, exc: RequestValidationError) -> J
 
 # --- health ------------------------------------------------------------------
 
-@app.get("/v1/health", tags=["meta"])
+@app.get(
+    "/v1/health",
+    tags=["meta"],
+    summary="Service health",
+    description=(
+        "Session-pool counts, cache backend actually in use, and the auth mode. "
+        "Never contains token material, so it is safe to expose publicly."
+    ),
+)
 async def health() -> dict:
     """Honest health: session pool counts, redis presence, version. No token material."""
     pool = app.state.pool
@@ -251,13 +291,42 @@ async def health() -> dict:
 
 # --- profile endpoint --------------------------------------------------------
 
-@app.post("/v1/profile", response_model=ProfileResponse, tags=["profile"])
+@app.post(
+    "/v1/profile",
+    response_model=ProfileResponse,
+    tags=["profile"],
+    summary="Fetch a profile by URL (JSON body)",
+    description="Same as `GET /v1/profile`, with the URL in a JSON body.",
+)
 async def post_profile(req: ProfileRequest, request: Request, x_api_key: str | None = Header(None)) -> ProfileResponse:
     _check_api_key(x_api_key)
     return await _fetch_profile(req.url, req.refresh, request)
 
 
-@app.get("/v1/profile", response_model=ProfileResponse, tags=["profile"])
+@app.get(
+    "/v1/profile",
+    response_model=ProfileResponse,
+    tags=["profile"],
+    summary="Fetch a profile by URL",
+    description=(
+        "Returns name, headline, location, about, experience, education, skills, "
+        "certifications, languages and profile images, as available.\n\n"
+        "**`url`** accepts any LinkedIn profile form: with or without a trailing "
+        "slash, a locale prefix, a query string, `http://`, or a bare slug.\n\n"
+        "**`refresh=true`** bypasses the cache and forces a live fetch.\n\n"
+        "`meta.source` names the strategy that served the response; "
+        "`meta.partial_sections` lists any mapper that degraded."
+    ),
+    responses={
+        400: {"description": "`INVALID_URL` — not a parseable LinkedIn profile URL"},
+        401: {"description": "`UNAUTHORIZED` — missing or invalid `X-API-Key`"},
+        403: {"description": "`PROFILE_PRIVATE` — not visible to this session"},
+        404: {"description": "`PROFILE_NOT_FOUND` — no data from any strategy"},
+        429: {"description": "`RATE_LIMITED` — client-side rate limit"},
+        502: {"description": "`UPSTREAM_CHALLENGE` — LinkedIn challenged the session"},
+        503: {"description": "`ALL_SESSIONS_COOLING` — every session is cooling down"},
+    },
+)
 async def get_profile(url: str, request: Request, refresh: bool = False, x_api_key: str | None = Header(None)) -> ProfileResponse:
     _check_api_key(x_api_key)
     return await _fetch_profile(url, refresh, request)

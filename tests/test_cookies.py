@@ -265,3 +265,46 @@ class TestAuthGating:
         monkeypatch.setattr(m, "settings", self._settings(API_KEY="", ALLOW_UNAUTHENTICATED="false"))
         with pytest.raises(UnauthorizedError):
             m._check_api_key(None)
+
+
+class TestChallengeCookiePoisoning:
+    """A challenge response must never contaminate the stored session.
+
+    LinkedIn's 999 page sets trkCode/trkInfo/rtc. Persisting those makes every
+    later request identify as the client that was already challenged, so the
+    session never recovers — it looks like a dead account but is a poisoned jar.
+    """
+
+    def test_challenge_cookies_are_never_stored(self) -> None:
+        from app.linkedin.client import CHALLENGE_COOKIES
+
+        s = Session(li_at="tok", jsessionid="ajax:1", cookies=[Cookie("li_at", "tok", ".d")])
+        s.update_from_jar({n: "poison" for n in CHALLENGE_COOKIES})
+        # update_from_jar itself is not the filter; the client is. Assert the names
+        # we filter on are the ones the challenge page actually sets.
+        assert {"trkCode", "trkInfo", "rtc"} <= set(CHALLENGE_COOKIES)
+
+    def test_client_filters_challenge_cookies(self) -> None:
+        from app.config import Settings
+        from app.linkedin.client import LinkedInClient
+
+        class FakeJar:
+            def keys(self):
+                return ["li_at", "trkCode", "trkInfo", "rtc"]
+
+            def get(self, name):
+                return {"li_at": "rotated", "trkCode": "gf",
+                        "trkInfo": "x", "rtc": "y"}[name]
+
+        class FakeHttp:
+            cookies = FakeJar()
+
+        s = Session(li_at="old", jsessionid="ajax:1", cookies=[Cookie("li_at", "old", ".d")])
+        pool = SessionPool(sessions=[s])
+        client = LinkedInClient(settings=Settings(_env_file=None), pool=pool)  # type: ignore[call-arg]
+        client._harvest_cookies(s, FakeHttp())
+
+        names = {c.name for c in s.cookies}
+        assert "trkCode" not in names and "trkInfo" not in names and "rtc" not in names
+        # The legitimate rotation still lands.
+        assert s.li_at == "rotated"

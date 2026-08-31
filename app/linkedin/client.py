@@ -16,6 +16,7 @@ at the libcurl level. See BUILD_SPEC.md section 1 for the load-bearing rationale
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -26,12 +27,39 @@ import orjson
 from app.config import Settings
 from app.linkedin.session import Session, SessionPool
 
-# A current, plausible Chrome UA. Update alongside IMPERSONATE in .env.example
-# when curl_cffi adds a newer impersonation target.
+# Must stay consistent with IMPERSONATE (see .env.example): a UA advertising one
+# Chrome version over another version's TLS handshake is a free bot signal.
 CHROME_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 )
+SEC_CH_UA = '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"'
+
+# The Voyager web client version, taken from captured traffic. This must be a REAL
+# build number: the previous value here was the literal string "1.13.*", which no
+# browser ever sends and which flags the request immediately. Distinct from the
+# flagship SDUI version (0.2.x) in strategies/flagship_web.py — different apps,
+# validated separately. Refresh from a capture when recalibrating.
+VOYAGER_CLIENT_VERSION = "1.13.46312"
+
+_X_LI_TRACK = json.dumps(
+    {
+        "clientVersion": VOYAGER_CLIENT_VERSION,
+        "mpVersion": VOYAGER_CLIENT_VERSION,
+        "osName": "web",
+        "timezoneOffset": 5.5,
+        "timezone": "Asia/Calcutta",
+        "deviceFormFactor": "DESKTOP",
+        "mpName": "voyager-web",
+    },
+    separators=(",", ":"),
+)
+
+
+# Cookies LinkedIn sets on its anti-automation challenge page. They must never be
+# persisted into a session: replaying them tells LinkedIn the client is the one it
+# already challenged, so the session cannot recover on its own.
+CHALLENGE_COOKIES = frozenset({"trkCode", "trkInfo", "rtc", "aam_uuid", "AMCV_"})
 
 
 class Outcome(StrEnum):
@@ -171,10 +199,18 @@ def build_headers(session: Session) -> dict[str, str]:
         "x-restli-protocol-version": "2.0.0",
         "accept": "application/vnd.linkedin.normalized+json+2.1",
         "x-li-lang": "en_US",
-        "x-li-track": '{"clientVersion":"1.13.*","osName":"web","timezoneOffset":5.5}',
+        "x-li-track": _X_LI_TRACK,
         "user-agent": CHROME_UA,
         "accept-language": "en-US,en;q=0.9",
         "referer": "https://www.linkedin.com/feed/",
+        # Client hints a real Chrome always sends alongside this UA.
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "priority": "u=1, i",
     }
 
 
@@ -244,9 +280,15 @@ class LinkedInClient:
 
         li_at rotates in normal use; keeping the old value is what turns a healthy
         account into blanket 401s. Never logs cookie values.
+
+        Cookies set by a challenge response are dropped — see CHALLENGE_COOKIES.
         """
         try:
-            jar = {name: http.cookies.get(name) for name in http.cookies.keys()}
+            jar = {
+                name: http.cookies.get(name)
+                for name in http.cookies.keys()
+                if name not in CHALLENGE_COOKIES
+            }
         except Exception as e:  # jar shape varies across curl_cffi versions
             if self.log:
                 self.log.debug("client.cookie_harvest_failed", error=str(e))
@@ -308,7 +350,6 @@ class LinkedInClient:
             allow_redirects=True,
             max_redirects=5,
         )
-        self._harvest_cookies(session, http)
         body = resp.content if hasattr(resp, "content") else b""
         status = getattr(resp, "status_code", 0)
         # curl_cffi Response has .headers as a dict-like; normalize.
@@ -340,6 +381,15 @@ class LinkedInClient:
                     self.log.debug(
                         "client.envelope_error", status=inner, outcome=outcome.value
                     )
+
+        # Harvest ONLY from a healthy response. A 999 challenge page sets its own
+        # tracking cookies, and folding those into the session makes every later
+        # request advertise "this client was challenged" — the session then never
+        # recovers, which reads as a dead account rather than a poisoned jar.
+        if outcome is Outcome.OK:
+            self._harvest_cookies(session, http)
+        elif self.log:
+            self.log.debug("client.harvest_skipped", outcome=outcome.value)
 
         return ClassifiedResponse(
             outcome=outcome,
