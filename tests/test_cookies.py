@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -311,16 +312,15 @@ class TestChallengeCookiePoisoning:
 
 
 class TestCollectionMetadataIsolation:
-    """A dash collection wrapper must not leak into the merged data root.
+    """Collection bookkeeping is dropped, but `*elements` must survive.
 
-    A dash query answers with {entityUrn, paging, *elements} describing the QUERY,
-    and `*elements` there points at the profile itself. Merged to the data root it
-    collides with the experience mapper's `elements` key, which then emits the
-    Profile entity as a position — one empty job carrying the profile's country as
-    its location. Caught against a real live payload.
+    A dash query answers with {entityUrn, paging, *elements}. The first two describe
+    the query and are noise; `*elements` resolves to the Profile entity that carries
+    location, follower count and images, so dropping it blanks the core profile.
+    Keeping it is why the experience mapper has its own Profile guard.
     """
 
-    def test_wrapper_keys_are_dropped(self) -> None:
+    def test_query_bookkeeping_is_dropped(self) -> None:
         from app.linkedin.strategies.legacy import _merge_envelopes
 
         dash = {
@@ -333,11 +333,21 @@ class TestCollectionMetadataIsolation:
             "included": [{"$type": "com.linkedin.voyager.identity.profile.Profile"}],
         }
         merged = _merge_envelopes(dash, None, {})
-        assert "elements" not in merged["data"]
-        assert "*elements" not in merged["data"]
         assert "paging" not in merged["data"]
-        # The entities themselves must survive.
+        assert "entityUrn" not in merged["data"]
+        # The pointer to the Profile entity is load-bearing for the core mapper.
+        assert merged["data"]["*elements"] == ["urn:li:fsd_profile:XYZ"]
         assert len(merged["included"]) == 1
+
+    def test_profile_entity_is_not_mapped_as_a_position(self) -> None:
+        """The guard that keeps `*elements` safe for the experience mapper."""
+        from app.normalize.sections.experience import _is_profile_entity
+
+        assert _is_profile_entity(
+            {"$type": "com.linkedin.voyager.dash.identity.profile.Profile"}
+        )
+        assert _is_profile_entity({"firstName": "Ada", "lastName": "Lovelace"})
+        assert not _is_profile_entity({"title": "Engineer", "companyName": "Acme"})
 
     def test_real_section_data_survives(self) -> None:
         from app.linkedin.strategies.legacy import _merge_envelopes
@@ -345,3 +355,43 @@ class TestCollectionMetadataIsolation:
         dash = {"data": {"entityUrn": "x", "firstName": "Ada"}, "included": []}
         merged = _merge_envelopes(dash, None, {})
         assert merged["data"]["firstName"] == "Ada"
+
+
+class TestVectorImageExtraction:
+    """Dash nests images under displayImage.vectorImage; artifacts carry sizes."""
+
+    PIC: ClassVar[dict] = {
+        "displayImage": {
+            "vectorImage": {
+                "rootUrl": "https://media.licdn.com/dms/image/v2/ABC/photo_",
+                "artifacts": [
+                    {"width": 100, "height": 100, "fileIdentifyingUrlPathSegment": "100_100/x?e=1"},
+                    {"width": 400, "height": 400, "fileIdentifyingUrlPathSegment": "400_400/x?e=1"},
+                ],
+            }
+        }
+    }
+
+    def test_nested_vector_image_is_found(self) -> None:
+        from app.normalize.sections.core import _extract_images
+
+        got = _extract_images(self.PIC)
+        assert [(w, h) for _, w, h in got] == [(100, 100), (400, 400)]
+        assert got[0][0] == "https://media.licdn.com/dms/image/v2/ABC/photo_100_100/x?e=1"
+
+    def test_flat_shape_still_works(self) -> None:
+        from app.normalize.sections.core import _extract_images
+
+        flat = {"rootUrl": "https://x/", "artifacts": [{"fileIdentifyingUrlPathSegment": "a.jpg"}]}
+        assert _extract_images(flat) == [("https://x/a.jpg", None, None)]
+
+    def test_absolute_segment_is_not_prefixed(self) -> None:
+        from app.normalize.sections.core import _extract_images
+
+        pic = {"rootUrl": "https://x/", "artifacts": [{"fileIdentifyingUrlPathSegment": "https://y/a.jpg"}]}
+        assert _extract_images(pic)[0][0] == "https://y/a.jpg"
+
+    def test_empty_picture_is_safe(self) -> None:
+        from app.normalize.sections.core import _extract_images
+
+        assert _extract_images({}) == []

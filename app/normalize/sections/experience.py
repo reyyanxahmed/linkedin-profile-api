@@ -15,6 +15,18 @@ from app.normalize.dates import duration_months, parse_date
 from app.normalize.urn_graph import UrnGraph
 
 
+def _is_profile_entity(node: dict) -> bool:
+    """True when a node is a Profile rather than a position.
+
+    Checked by $type first, then by profile-only fields, so it holds across the
+    legacy and dash generations.
+    """
+    t = node.get("$type", "")
+    if isinstance(t, str) and t.endswith((".Profile", ".MiniProfile", ".FsdProfile")):
+        return True
+    return any(k in node for k in ("firstName", "lastName", "publicIdentifier"))
+
+
 def map_experience(graph: UrnGraph, raw: dict | None = None) -> list[Experience]:
     """Map experience positions from a resolved Voyager payload."""
     root = graph.root() if isinstance(graph, UrnGraph) else (raw or {})
@@ -29,6 +41,12 @@ def map_experience(graph: UrnGraph, raw: dict | None = None) -> list[Experience]
         if isinstance(nodes, list):
             for n in nodes:
                 if isinstance(n, dict):
+                    if _is_profile_entity(n):
+                        # A dash collection response resolves `*elements` to the
+                        # Profile itself. Without this guard it is emitted as a
+                        # position: an entry with no title or company whose
+                        # "location" is the profile's country code.
+                        continue
                     # positionGroup contains *positionView list; unwrap.
                     pv = n.get("positionView") or n.get("*positionView")
                     if isinstance(pv, list):

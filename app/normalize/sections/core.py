@@ -53,6 +53,20 @@ def map_profile(graph: UrnGraph, raw: dict | None = None) -> Profile:
     )
 
 
+# Fields that identify a dict as a profile entity rather than a container of
+# sections. Spans the legacy and dash generations.
+_PROFILE_MARKERS = (
+    "firstName", "first_name", "lastName", "last_name", "fullName", "full_name",
+    "headline", "summary", "publicIdentifier", "occupation", "geoLocation",
+    "profilePicture", "pictureInfo",
+)
+
+
+def _looks_like_profile(d: Any) -> bool:
+    """True when a dict carries at least one identifying profile field."""
+    return isinstance(d, dict) and any(k in d for k in _PROFILE_MARKERS)
+
+
 def _find_profile_entity(graph: UrnGraph, root: Any) -> dict:
     """Locate the profile entity in the payload. Merge root-level fields with the
     resolved *profile entity (root takes precedence — it is the canonical `data`).
@@ -74,9 +88,16 @@ def _find_profile_entity(graph: UrnGraph, root: Any) -> dict:
                 prof.setdefault(k, v)
         # If the root itself looks like a profile (legacy profileView data shape),
         # use it directly.
-        if not prof and ("firstName" in root or "first_name" in root or "headline" in root):
+        if not prof and _looks_like_profile(root):
             return root
-        if prof:
+        # Only accept the assembled dict if it actually carries profile fields.
+        #
+        # The merged root also holds one key per fetched sub-resource
+        # (positionGroups, certifications, languages, ...). Those make `prof`
+        # truthy without containing a single profile field, which previously
+        # short-circuited the by_type fallback below and returned a profile of all
+        # nulls while the real Profile entity sat in `included`.
+        if prof and _looks_like_profile(prof):
             return prof
     # Fallback: scan included for a Profile-typed entity.
     if isinstance(graph, UrnGraph):
@@ -137,40 +158,75 @@ def _map_images(prof: dict) -> ProfileImages:
 
     pic = _get(prof, "pictureInfo", "picture", "profilePicture")
     if isinstance(pic, dict):
-        for url in _extract_image_urls(pic):
-            profile_imgs.append(Image(url=url, expires_at=parse_image_expiry(url)))
+        for url, w, h in _extract_images(pic):
+            profile_imgs.append(
+                Image(url=url, width=w, height=h, expires_at=parse_image_expiry(url))
+            )
     elif isinstance(pic, str):
         profile_imgs.append(Image(url=pic, expires_at=parse_image_expiry(pic)))
 
     bg = _get(prof, "backgroundImage", "backgroundPicture", "backgroundInfo")
     if isinstance(bg, dict):
-        for url in _extract_image_urls(bg):
-            bg_imgs.append(Image(url=url, expires_at=parse_image_expiry(url)))
+        for url, w, h in _extract_images(bg):
+            bg_imgs.append(
+                Image(url=url, width=w, height=h, expires_at=parse_image_expiry(url))
+            )
     elif isinstance(bg, str):
         bg_imgs.append(Image(url=bg, expires_at=parse_image_expiry(bg)))
 
     return ProfileImages(profile=profile_imgs, background=bg_imgs)
 
 
-def _extract_image_urls(pic: dict) -> list[str]:
-    """Pull image URLs from a pictureInfo/artifacts-shaped dict."""
-    urls: list[str] = []
-    # Common shape: { *rootUrl: "...", artifacts: [ { fileIdentifyingUrlPathSegment, width, height } ] }
-    root = pic.get("rootUrl") or pic.get("*rootUrl") or ""
-    artifacts = pic.get("artifacts") or pic.get("*artifacts") or []
-    if isinstance(artifacts, list):
-        for a in artifacts:
+def _vector_image(pic: dict) -> dict | None:
+    """Find the vectorImage node holding rootUrl + artifacts.
+
+    The dash generation nests it as picture.displayImage.vectorImage, while older
+    payloads put rootUrl/artifacts directly on the picture. Both appear in live
+    traffic, so both are walked rather than assuming one.
+    """
+    for candidate in (
+        pic,
+        pic.get("vectorImage"),
+        (pic.get("displayImage") or {}).get("vectorImage")
+        if isinstance(pic.get("displayImage"), dict)
+        else None,
+    ):
+        if isinstance(candidate, dict) and candidate.get("artifacts"):
+            return candidate
+    return None
+
+
+def _extract_images(pic: dict) -> list[tuple[str, int | None, int | None]]:
+    """Pull (url, width, height) from a picture entity.
+
+    A LinkedIn image is a rootUrl plus one artifact per rendered size; the full URL
+    is the concatenation. Dimensions come from the artifact, so they are carried
+    through instead of being reported as null.
+    """
+    out: list[tuple[str, int | None, int | None]] = []
+    node = _vector_image(pic)
+    if node:
+        root = node.get("rootUrl") or node.get("*rootUrl") or ""
+        for a in node.get("artifacts") or []:
             if not isinstance(a, dict):
                 continue
             seg = a.get("fileIdentifyingUrlPathSegment")
-            if isinstance(seg, str):
-                urls.append(root + seg if not seg.startswith("http") else seg)
-    # Also accept a direct 'url' or 'displayImageReference'.
-    if not urls:
+            if not isinstance(seg, str):
+                continue
+            url = seg if seg.startswith("http") else root + seg
+            width = a.get("width") if isinstance(a.get("width"), int) else None
+            height = a.get("height") if isinstance(a.get("height"), int) else None
+            out.append((url, width, height))
+    if not out:
         url = pic.get("url") or pic.get("displayImageReference")
         if isinstance(url, str):
-            urls.append(url)
-    return urls
+            out.append((url, None, None))
+    return out
+
+
+def _extract_image_urls(pic: dict) -> list[str]:
+    """URLs only. Kept for callers that do not need dimensions."""
+    return [u for u, _, _ in _extract_images(pic)]
 
 
 def _map_counts(prof: dict, root: Any) -> Counts:

@@ -184,9 +184,12 @@ def _urn_from_positions(positions: dict) -> str | None:
     return None
 
 
-# Keys that describe a Rest.li collection response rather than profile content.
-# They must not reach the merged data root; see _merge_envelopes.
-_COLLECTION_META = {"entityUrn", "paging", "*elements", "elements", "$type"}
+# Keys that describe the Rest.li collection response itself rather than profile
+# content. `*elements` is deliberately NOT here: it resolves to the Profile entity
+# that the core mapper reads for location, follower counts and images. The
+# experience mapper is what must not mistake it for a position list, and that is
+# handled there.
+_COLLECTION_META = {"entityUrn", "paging", "$type"}
 
 
 def _merge_envelopes(
@@ -204,13 +207,9 @@ def _merge_envelopes(
 
     # Dash profile (core profile data).
     #
-    # Only the entities are merged, never the collection-response wrapper. A dash
-    # query answers with {entityUrn, paging, *elements} describing the QUERY, and
-    # `*elements` there points at the profile itself. Merging that to the data root
-    # collides with the experience mapper's `elements` key, which then maps the
-    # Profile entity as if it were a position — one empty job with the profile's
-    # country as its location. The Position entities live in `included` and are
-    # reached through the URN graph.
+    # The collection-response bookkeeping (entityUrn, paging) is dropped; `*elements`
+    # is kept because it resolves to the Profile entity carrying location, follower
+    # count and images.
     if isinstance(dash.get("included"), list):
         included.extend(dash["included"])
     if isinstance(dash.get("data"), dict):
