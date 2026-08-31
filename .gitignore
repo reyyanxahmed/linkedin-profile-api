@@ -49,3 +49,11 @@ package.json
 package-lock.json
 .vercel/
 .vercel
+
+# Private working documents. Kept on disk, never published: the challenge PDF is
+# Tross's own assessment material, and the rest are internal notes rather than
+# deliverables. Purged from history on 2026-08-31.
+Engineer Hiring Challenge.pdf
+BUILD_SPEC.md
+tross-linkedin-api-plan.md
+CLAUDE.md
