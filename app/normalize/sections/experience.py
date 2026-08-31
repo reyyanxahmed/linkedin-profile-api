@@ -47,12 +47,43 @@ def map_experience(graph: UrnGraph, raw: dict | None = None) -> list[Experience]
     return [_map_one(p) for p in positions]
 
 
+def _as_text(v: object) -> str | None:
+    """Coerce a Voyager value that may be a string or an entity dict into text.
+
+    Voyager is inconsistent about this: `locationName` is a plain string on legacy
+    Position entities, but the dash generation hands back a ProfileLocation entity
+    ({'countryCode': 'US', ...}) under `location`. Feeding that dict straight into a
+    `str | None` model field raises, and one raising mapper empties the whole
+    experience section — so normalize the shape here.
+    """
+    if v is None or (isinstance(v, (list, dict)) and not v):
+        return None
+    if isinstance(v, str):
+        return v.strip() or None
+    if isinstance(v, dict):
+        for key in ("locationName", "defaultLocalizedName", "name", "text", "countryCode"):
+            got = v.get(key)
+            if isinstance(got, str) and got.strip():
+                return got.strip()
+        return None
+    return str(v)
+
+
+def _location_text(p: dict) -> str | None:
+    """Best available location string for a position, across all three generations."""
+    for key in ("locationName", "geoLocationName", "location", "region"):
+        text = _as_text(p.get(key))
+        if text:
+            return text
+    return None
+
+
 def _map_one(p: dict) -> Experience:
     title = p.get("title") or p.get("name")
-    company = _map_company(p.get("company") or p.get("*company"))
+    company = _map_company(p.get("company") or p.get("*company"), p)
     emp_type = p.get("employmentStatus") or p.get("employmentType")
-    location = p.get("locationName") or p.get("location")
-    location_type = p.get("locationType") or p.get("workLocationType")
+    location = _location_text(p)
+    location_type = _as_text(p.get("locationType") or p.get("workLocationType"))
 
     tp = p.get("timePeriod") or {}
     start_raw = tp.get("startDate") or {}
@@ -81,19 +112,32 @@ def _map_one(p: dict) -> Experience:
     )
 
 
-def _map_company(company: Any) -> CompanyRef | None:
-    if not company:
-        return None
+def _map_company(company: Any, position: dict | None = None) -> CompanyRef | None:
+    """Build a CompanyRef from a position's company reference.
+
+    The legacy Position entity keeps the company NAME on the position itself
+    (`companyName`) while `company` holds only a PositionCompany with industry and
+    headcount — no name at all. Reading the name from the sub-entity alone yields
+    null companies on every legacy position, so the position is passed in as the
+    authoritative name source and the sub-entity fills in the rest.
+    """
+    position = position or {}
+    name_on_position = position.get("companyName")
+    urn_on_position = position.get("companyUrn")
+
     if isinstance(company, str):
-        # Raw URN; we lost the name (company not in included). Best effort.
-        return CompanyRef(urn=company, name=None)
+        # Raw URN; the company entity was not in `included`. Best effort.
+        return CompanyRef(urn=company, name=name_on_position)
     if isinstance(company, dict):
         return CompanyRef(
-            name=company.get("name"),
-            urn=company.get("entityUrn") or company.get("urn"),
+            name=company.get("name") or name_on_position,
+            urn=company.get("entityUrn") or company.get("urn") or urn_on_position,
             linkedin_url=company.get("url") or company.get("linkedinUrl"),
             logo=_extract_logo(company.get("logo") or company.get("*logo")),
         )
+    if name_on_position or urn_on_position:
+        return CompanyRef(name=name_on_position, urn=urn_on_position)
+    return None
     return None
 
 

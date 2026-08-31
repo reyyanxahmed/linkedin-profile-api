@@ -59,6 +59,16 @@ class ProfileCache:
         except Exception:
             self._redis = None  # type: ignore[assignment]
 
+    @property
+    def backend(self) -> str:
+        """Which backend is actually serving: "redis" or "memory".
+
+        Reported by /v1/health. `bool(REDIS_URL)` is not the same question — a
+        configured-but-unreachable Redis falls back to memory, and a health endpoint
+        that still claims "redis" is lying about the deployment.
+        """
+        return "redis" if self._redis is not None else "memory"
+
     async def close(self) -> None:
         if self._redis is not None:
             try:

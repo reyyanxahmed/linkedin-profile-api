@@ -34,16 +34,32 @@ VOYAGER_BASE = "https://www.linkedin.com/voyager/api"
 
 # Sub-resources that return normalized JSON. Some are deprecated (410) but we
 # try them all — the ones that work contribute their data to the merged envelope.
+# Sub-resources still worth requesting.
+#
+# Deliberately does NOT include `skills`, `educations` (both 410 Gone) or `volunteer`
+# (404). Those were verified dead against live traffic — see docs/REVERSE_ENGINEERING.md.
+# Requesting them cost three round-trips per profile and returned tombstones every
+# time, which matters twice over: latency on a serverless host with a request
+# deadline, and wasted requests against a session LinkedIn rate-limits aggressively.
+#
+# The ones kept below answer 200. They are frequently empty (not every profile has
+# honors or courses), which is a different thing from being retired.
 SUB_RESOURCES = [
-    "skills",
-    "educations",
     "certifications",
     "languages",
     "projects",
     "honors",
-    "volunteer",
     "courses",
 ]
+
+# Sub-resources confirmed retired by LinkedIn, kept as documentation so nobody
+# re-adds them after seeing an empty section and assuming an oversight.
+RETIRED_SUB_RESOURCES = {
+    "skills": 410,
+    "educations": 410,
+    "profileView": 410,
+    "volunteer": 404,
+}
 
 
 class LegacyStrategy:
@@ -62,18 +78,22 @@ class LegacyStrategy:
     }
 
     async def fetch(self, slug: str, client: Any) -> FetchResult | None:
-        # 1. Fetch the dash profile for core data + URN
+        # 1. Fetch the dash profile for core data + URN.
+        #
+        # A failure here is NOT fatal. These sub-resources have independent
+        # availability — dash/profiles rate-limits far more aggressively than
+        # positionGroups, and several legacy sub-resources are 410 Gone permanently.
+        # Aborting the whole strategy on the first failure threw away the experience
+        # data that had already been fetched successfully.
         dash_url = f"{VOYAGER_BASE}/identity/dash/profiles?q=memberIdentity&memberIdentity={slug}"
         resp = await client.fetch(dash_url)
-        if resp.outcome is not Outcome.OK:
+        dash_data: dict | None = None
+        if resp.outcome is Outcome.OK:
+            dash_data = _decode(resp)
+        else:
             log.warning("voyager_rest.dash_failed", slug=slug, outcome=resp.outcome.value)
-            return None
 
-        dash_data = _decode(resp)
-        if dash_data is None:
-            return None
-
-        profile_urn = _extract_urn(dash_data)
+        profile_urn = _extract_urn(dash_data) if dash_data else None
 
         # 2. Fetch positionGroups (experience) — this endpoint is still alive
         pos_url = f"{VOYAGER_BASE}/identity/profiles/{slug}/positionGroups"
@@ -90,8 +110,20 @@ class LegacyStrategy:
             else:
                 sub_results[resource] = None
 
-        # 4. Merge all responses into a single normalized envelope
-        merged = _merge_envelopes(dash_data, pos_data, sub_results)
+        # The profile URN also lives inside every position's entityUrn, as
+        # urn:li:fs_position:(<profileId>,<positionId>). That is the fallback when
+        # dash/profiles was unavailable.
+        if not profile_urn and pos_data:
+            profile_urn = _urn_from_positions(pos_data)
+
+        # 4. Merge whatever came back into a single normalized envelope.
+        merged = _merge_envelopes(dash_data or {}, pos_data, sub_results)
+
+        # Succeed only if something actually carried data. An envelope of nothing is
+        # a failure, and reporting it as success would stop the fallback chain.
+        if not merged.get("included") and not merged.get("data"):
+            log.info("voyager_rest.no_data", slug=slug)
+            return None
 
         return FetchResult(payload=merged, profile_urn=profile_urn, source=self.name)
 
@@ -130,6 +162,25 @@ def _extract_urn(payload: dict) -> str | None:
         urn = ent.get("entityUrn") or ent.get("objectUrn")
         if isinstance(urn, str) and urn.startswith("urn:li:fsd_profile:"):
             return urn
+    return None
+
+
+def _urn_from_positions(positions: dict) -> str | None:
+    """Recover the profile URN from a position entityUrn.
+
+    Positions are keyed as urn:li:fs_position:(<profileId>,<positionId>), so the
+    profile id can be read straight out of the compound key when the dedicated
+    profile endpoint is unavailable.
+    """
+    for ent in positions.get("included", []):
+        if not isinstance(ent, dict):
+            continue
+        urn = ent.get("entityUrn")
+        if isinstance(urn, str) and urn.startswith("urn:li:fs_position:("):
+            inner = urn.split("(", 1)[1].rstrip(")")
+            profile_id = inner.split(",", 1)[0].strip()
+            if profile_id:
+                return f"urn:li:fsd_profile:{profile_id}"
     return None
 
 

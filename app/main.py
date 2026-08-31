@@ -32,6 +32,7 @@ from pydantic import BaseModel as PydanticBaseModel
 from app.cache import ProfileCache
 from app.config import settings
 from app.errors import AppError, NoSessionsError, UnauthorizedError
+from app.linkedin import cookie_store
 from app.linkedin.client import LinkedInClient
 from app.linkedin.orchestrator import Orchestrator
 from app.linkedin.session import SessionPool
@@ -80,18 +81,16 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     log = get_logger("app.lifespan")
 
     # Session pool from env. Empty LI_SESSIONS -> empty pool -> auth strategies skip.
-    pool = SessionPool(
-        sessions=[
-            s for s in (
-                # Build Session objects from the config SessionConfig list.
-                __import__("app.linkedin.session", fromlist=["Session"]).Session(
-                    li_at=sc.li_at, jsessionid=sc.jsessionid
-                )
-                for sc in settings.sessions
-            )
-        ],
+    pool = SessionPool.from_raw(
+        settings.sessions,
         cooldown_seconds=settings.session_cooldown_seconds,
     )
+    # Persisted cookies win over LI_SESSIONS: li_at rotates in normal use, and the
+    # persisted copy is whatever LinkedIn handed us most recently. Without this, a
+    # restart replays a stale li_at and every request 401s on a healthy account.
+    restored = cookie_store.apply(pool.sessions, cookie_store.load(settings.cookie_state_path))
+    if restored:
+        log.info("cookies.restored", sessions=restored)
     app.state.pool = pool
 
     # Cache.
@@ -101,6 +100,10 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
 
     # Client + orchestrator.
     client = LinkedInClient(settings=settings, pool=pool, log=log)
+    # Persist rotated cookies as soon as LinkedIn issues them.
+    client.on_cookies_changed = lambda: cookie_store.save(
+        settings.cookie_state_path, pool.sessions
+    )
     app.state.client = client
     app.state.orchestrator = Orchestrator(settings)
 
@@ -112,6 +115,9 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     try:
         yield
     finally:
+        # Save once more on the way out so an in-flight rotation is not lost.
+        cookie_store.save(settings.cookie_state_path, pool.sessions)
+        await client.close()
         await cache.close()
         log.info("app.stopped")
 
@@ -162,7 +168,9 @@ async def proxy_image(url: str) -> Response:
     if not url.startswith("https://media.licdn.com/"):
         return JSONResponse(status_code=400, content={"error": "only media.licdn.com URLs allowed"})
     try:
-        client = AsyncSession(impersonate="chrome124")
+        # Same impersonation target as the main client; a stale hardcoded value
+        # here would present a different TLS fingerprint from the same deployment.
+        client = AsyncSession(impersonate=settings.impersonate)
         resp = await client.get(url, headers={"Referer": "https://www.linkedin.com/"})
         content_type = resp.headers.get("content-type", "image/jpeg")
         return Response(content=resp.content, media_type=content_type)
@@ -224,7 +232,8 @@ async def health() -> dict:
         "status": "ok",
         "version": APP_VERSION,
         "sessions": pool.health(),
-        "redis": bool(settings.redis_url),
+        # The backend actually in use, not merely what was configured.
+        "cache": app.state.cache.backend,
         "has_api_key": settings.has_api_key,
     }
 
@@ -297,15 +306,20 @@ async def _fetch_profile(raw_url: str, refresh: bool, request: Request) -> Profi
     if result.source == "flagship_web_rsc" and isinstance(primary, dict):
         # Flagship-web RSC payload: text lists, not normalized envelope.
         from app.linkedin.strategies.flagship_web import (
+            map_certifications_from_rsc,
             map_education_from_rsc,
             map_experience_from_rsc,
             map_languages_from_rsc,
             map_profile_from_rsc,
         )
         main_texts = primary.get("main_texts", [])
-        exp_texts = primary.get("experience_texts", [])
-        lang_texts = primary.get("language_texts", [])
-        about_texts = primary.get("about_texts", [])
+        # The card components are pooled: which "BelowActivityPartN" holds which
+        # section is not stable across profiles or deploys, so every card mapper
+        # scans the union rather than one named bucket.
+        card_texts = primary.get("card_texts") or primary.get("experience_texts", [])
+        exp_texts = card_texts
+        lang_texts = card_texts
+        about_texts = card_texts
 
         try:
             profile = map_profile_from_rsc(main_texts, about_texts)
@@ -315,9 +329,12 @@ async def _fetch_profile(raw_url: str, refresh: bool, request: Request) -> Profi
             from app.models import Profile
             profile = Profile()
         experience = _safe_map_list_rsc("experience", map_experience_from_rsc, exp_texts, partial)
-        education = _safe_map_list_rsc("education", map_education_from_rsc, main_texts, partial)
+        # Education lives in the card streams, not the main page stream.
+        education = _safe_map_list_rsc("education", map_education_from_rsc, card_texts, partial)
         skills: list = []
-        certifications: list = []
+        certifications = _safe_map_list_rsc(
+            "certifications", map_certifications_from_rsc, card_texts, partial
+        )
         languages = _safe_map_list_rsc("languages", map_languages_from_rsc, lang_texts, partial)
         projects: list = []
         publications: list = []

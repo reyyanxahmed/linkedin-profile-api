@@ -50,7 +50,16 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "RUF"]
-ignore = ["E501"]  # line length handled by formatter if used
+ignore = [
+    "E501",  # line length handled by formatter if used
+    # LinkedIn renders date ranges with an EN DASH ("2016 – 2020"). The card
+    # parsers must match that exact character, and the comments quoting real
+    # captured strings must reproduce it, so the ambiguous-character rules would
+    # force us to write patterns that do not match reality.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B011"]

@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# Rotated LinkedIn cookies, written at runtime. Live credentials.
+.cookie_state.json
+
 # Python
 __pycache__/
 *.pyc
@@ -39,3 +42,9 @@ captures/
 
 # Deploy artifacts
 fly.toml.bak
+
+# Vercel CLI artifacts
+node_modules/
+package.json
+package-lock.json
+.vercel/

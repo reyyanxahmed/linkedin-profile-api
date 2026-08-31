@@ -1,37 +1,165 @@
 # linkedin-profile-api
 
-A hosted HTTP API that takes a LinkedIn profile URL and returns the profile as
-structured JSON — built by hitting LinkedIn's internal Voyager endpoints directly
-over HTTP. **No browser anywhere in the runtime.**
+An HTTP API that takes a LinkedIn profile URL and returns the profile as structured JSON,
+built by hitting LinkedIn's internal endpoints directly over HTTP.
+
+**Purely reverse-engineered. No browser, anywhere.** Every LinkedIn request in this
+codebase is a direct HTTP call to a LinkedIn endpoint, issued by `curl_cffi`. There is no
+Selenium, Playwright, Puppeteer, headless Chrome, or webdriver — not in the runtime, not
+in the dev dependencies, not in the test suite, not anywhere in the transitive dependency
+tree. Nothing shells out to a browser binary. See
+[Verifying the no-browser claim](#verifying-the-no-browser-claim) for how to check this
+yourself in about thirty seconds.
 
 ```bash
 curl -s -H "X-API-Key: $API_KEY" \
-  "https://linkedin-profile-api.fly.dev/v1/profile?url=https://www.linkedin.com/in/reyyanxahmed" \
-  | jq '.profile, .experience[0], .meta.completeness'
+  "http://localhost:8000/v1/profile?url=https://www.linkedin.com/in/satyanadella/" \
+  | jq '.experience[] | {title, company: .company.name, start: .start.iso}'
 ```
 
 ```json
-{
-  "first_name": "Ada",
-  "last_name": "Lovelace",
-  "full_name": "Ada Lovelace",
-  "headline": "Analyst at Acme",
-  "about": "Pioneer of computing.",
-  "location": { "raw": "London, UK", "city": "London", "country": "United Kingdom", "country_code": "GB" }
-}
-{
-  "title": "Analyst",
-  "company": { "name": "Acme" },
-  "start": { "year": 2024, "month": 1, "iso": "2024-01" },
-  "is_current": true,
-  "duration_months": 12
-}
-0.86
+{ "title": "Chairman and CEO",         "company": "Microsoft",                 "start": "2014-02" }
+{ "title": "Board Member",             "company": "Fred Hutch",                "start": "2016" }
+{ "title": "Board Member",             "company": "Starbucks",                 "start": "2017" }
+{ "title": "Chairman",                 "company": "The Business Council U.S.", "start": "2021" }
+{ "title": "Member Board Of Trustees", "company": "University of Chicago",     "start": "2018" }
 ```
 
-> The output above is illustrative — the shape is stable; the values come from your
-> supplied URL. The `meta.source` field tells you which Voyager generation served the
-> response, and `meta.partial_sections` tells you which mappers degraded.
+That is real output from a live run, not an illustration. **Please read
+[Status: what works today](#status-what-works-today) before evaluating** — one section of
+the pipeline is blocked on an account-state problem, and this README is specific about
+which.
+
+---
+
+## Contents
+
+- [Verifying the no-browser claim](#verifying-the-no-browser-claim)
+- [Status: what works today](#status-what-works-today)
+- [Quickstart](#quickstart)
+- [API reference](#api-reference)
+- [Approach](#approach)
+- [Architecture](#architecture)
+- [Testing](#testing)
+- [Known limitations](#known-limitations)
+- [Security](#security)
+
+---
+
+## Verifying the no-browser claim
+
+Three checks, none of which require trusting this README.
+
+**1. The dependency tree.** The whole thing, transitively, is 38 packages:
+
+```bash
+uv venv && uv pip install -e ".[dev]"
+python -c "import importlib.metadata as m; print(sorted(d.metadata['Name'] for d in m.distributions()))"
+```
+
+```
+annotated-doc annotated-types anyio certifi cffi click curl_cffi fastapi h11 httpcore
+httptools httpx idna iniconfig linkedin-profile-api orjson packaging pluggy pycparser
+pydantic pydantic-settings pydantic_core Pygments pytest pytest-asyncio python-dotenv
+PyYAML redis ruff selectolax starlette structlog typing-inspection typing_extensions
+uvicorn uvloop watchfiles websockets
+```
+
+No automation library, no driver, no browser. `selectolax` is an HTML parser (C, no JS
+engine); `curl_cffi` is libcurl with Chrome's TLS fingerprint.
+
+```bash
+grep -riE "selenium|playwright|puppeteer|webdriver|chromedriver|nodriver" . --include="*.py" --include="*.toml"
+grep -rnE "subprocess|os\.system|Popen" app/          # nothing shells out
+```
+
+**2. The complete network surface.** Every outbound call in `app/` is
+`curl_cffi.AsyncSession.get()` or `.post()`. There are four call sites:
+
+| File | Purpose |
+|---|---|
+| `linkedin/client.py:301` | all Voyager REST requests |
+| `linkedin/strategies/flagship_web.py:424,429` | flagship RSC component POST / main GET |
+| `linkedin/strategies/public_html.py:57` | unauthenticated HTML fallback |
+| `main.py:172` | image proxy for `media.licdn.com` |
+
+**3. Reproduce a request with plain `curl`.** The requests are ordinary HTTP, so you can
+issue an identical one from a shell. This is the whole protocol, no library involved:
+
+```sh
+curl -sS --compressed -L --max-redirs 5 \
+  -b jar.txt -c jar.txt \
+  -H 'csrf-token: ajax:<JSESSIONID>' \
+  -H 'x-restli-protocol-version: 2.0.0' \
+  -H 'accept: application/vnd.linkedin.normalized+json+2.1' \
+  -H 'x-li-lang: en_US' \
+  -H 'x-li-track: {"clientVersion":"1.13.*","osName":"web","timezoneOffset":5.5}' \
+  -H 'referer: https://www.linkedin.com/feed/' \
+  'https://www.linkedin.com/voyager/api/identity/profiles/<slug>/positionGroups'
+```
+
+Two things this makes concrete, both verified by running it:
+
+- `-b jar.txt -c jar.txt` (a real cookie **jar**, read *and* written) is mandatory. With a
+  static `-b 'k=v'` string, curl exits `(47) Maximum redirects followed` — LinkedIn's
+  `lidc` datacenter hop never resolves. That is the single highest-value finding in this
+  project, and it reproduces outside the codebase.
+- Plain `/usr/bin/curl` gets LinkedIn's **999** anti-automation page for this request,
+  while `curl_cffi` with `impersonate="chrome150"` gets a 200 and real JSON — same URL,
+  same cookies, same headers. The only difference is the TLS/JA3 handshake. That is
+  precisely why `curl_cffi` is a dependency and why no browser is needed to defeat it.
+
+### On how the endpoints were found
+
+Endpoint discovery used Chrome devtools to record a HAR of a profile page load — reading
+LinkedIn's own traffic, the same way one would read a packet capture. That is recon, and
+it is how reverse engineering is done; it is not runtime browser automation.
+
+Nothing at runtime depends on it. The discovered facts — component ids, the required
+header set, the SDUI version — are constants in `app/linkedin/strategies/flagship_web.py`.
+Clone the repo, add cookies, and it runs. No HAR, no browser, no manual step.
+
+---
+
+## Status: what works today
+
+Being precise about this is more useful than a green checkmark.
+
+| Capability | State | Evidence |
+|---|---|---|
+| Slug → profile URN resolution | **Live** | `urn:li:fsd_profile:ACoAAA8BYqEB…` for `williamhgates` |
+| Experience (titles, companies, dates, locations) | **Live** | 3 positions for `williamhgates`, 5 for `satyanadella`, verified correct |
+| Name, headline, about, location, images | **Fixture-verified**, blocked live | Maps correctly from a captured stream; see below |
+| Education, certifications | **Fixture-verified**, blocked live | 2 schools + 1 certification from a real capture |
+| Skills, languages | Mappers exist, unverified | No populated capture to calibrate against |
+| Offline fixture mode | **Live** | `OFFLINE_MODE=true` serves complete profiles, zero network |
+| Test suite | **230 passing**, no network | `pytest -q` |
+
+### The one blocker, stated plainly
+
+The credentials available to this project authenticate LinkedIn's **API surface** but not
+its **web app**. With the same freshly exported cookies, in the same process:
+
+```
+GET /voyager/api/me                                        → 200, real data
+GET /voyager/api/identity/profiles/{slug}/positionGroups    → 200, real data
+GET /feed/                                                  → 302 → /uas/login
+GET /in/{slug}            (HTML)                            → 999 (anti-automation)
+GET /flagship-web/in/{slug}/                                → 200, empty body
+```
+
+Everything except experience comes from the flagship RSC transport, which lives behind
+web-app auth. So those sections are implemented and verified against real captured data,
+but cannot currently be fetched live. Dropping `__cf_bm`, reducing to only the auth
+cookies, and matching the browser's TLS fingerprint all fail to change it.
+
+Whether this is an account-level restriction on the burner, IP reputation, or a
+deliberate split between API and web auth is **not established**. It is the honest open
+question in this codebase, and it is documented rather than hidden behind an empty
+section in the response.
+
+The Voyager path that *does* work is not a consolation prize: it is the universal path
+that resolves any public slug and returns accurate structured experience.
 
 ---
 
@@ -39,370 +167,415 @@ curl -s -H "X-API-Key: $API_KEY" \
 
 ```bash
 git clone <repo> linkedin-profile-api && cd linkedin-profile-api
-cp .env.example .env                  # fill in API_KEY, LI_SESSIONS, REDIS_URL
+uv venv && uv pip install -e ".[dev]"
+cp .env.example .env          # fill in API_KEY and LI_SESSIONS
+uvicorn app.main:app --reload
+```
+
+Or with Docker:
+
+```bash
 docker run --rm -p 8000:8000 --env-file .env $(docker build -q .)
-# or, without docker:
-uv venv && uv pip install -e ".[dev]" && uvicorn app.main:app --reload
 ```
 
 Then:
 
 ```bash
-curl http://localhost:8000/v1/health          # unauthenticated health
-curl -H "X-API-Key: $API_KEY" http://localhost:8000/v1/profile?url=https://www.linkedin.com/in/slug
-open http://localhost:8000/docs               # OpenAPI / Swagger UI
+curl http://localhost:8000/v1/health                       # unauthenticated
+curl -H "X-API-Key: $API_KEY" \
+  "http://localhost:8000/v1/profile?url=https://www.linkedin.com/in/satyanadella/"
+open http://localhost:8000/docs                            # OpenAPI / Swagger UI
 ```
+
+### Try it with no LinkedIn account at all
+
+The whole thing runs offline against captured fixtures. This is the fastest way to see
+the output shape and to run the tests:
+
+```bash
+OFFLINE_MODE=true FIXTURE_DIR=tests/fixtures/rsc uvicorn app.main:app
+curl -H "X-API-Key: $API_KEY" \
+  "http://localhost:8000/v1/profile?url=https://www.linkedin.com/in/rajstriver/"
+```
+
+`OFFLINE_MODE=true` is a hard guarantee, not a preference: the strategy chain is reduced
+to the fixture-backed strategy alone, so nothing in it can open a socket.
+
+### Supplying credentials
+
+`LI_SESSIONS` is a JSON array. Paste a browser cookie export straight in — it is accepted
+unmodified:
+
+```jsonc
+// A raw cookie export (from Chrome devtools or an export extension)
+[[ {"name":"li_at","value":"AQED…","domain":".www.linkedin.com"},
+   {"name":"JSESSIONID","value":"\"ajax:123…\"","domain":".www.linkedin.com"},
+   {"name":"lidc","value":"\"b=OGST00:…\"","domain":".linkedin.com"},
+   {"name":"bcookie","value":"\"v=2&…\"","domain":".linkedin.com"} ]]
+```
+
+Two other shapes also work: `[{"cookies":[…]}]`, and the minimal
+`[{"li_at":"…","jsessionid":"ajax:…"}]`.
+
+**Supply the full cookie set, not just `li_at` + `JSESSIONID`.** `lidc` and `bcookie` are
+required — without them every identity endpoint redirects to itself until curl gives up.
+See [Approach](#approach).
 
 ---
 
 ## API reference
 
-### `POST /v1/profile`
+### `GET /v1/profile?url=…&refresh=false`
+### `POST /v1/profile` — body `{"url": "...", "refresh": false}`
 
-| Field | Type | Description |
-|---|---|---|
-| `url` | string | A LinkedIn profile URL (`linkedin.com/in/slug`, country subdomains, `/pub/`, bare slug) |
-| `refresh` | bool | Bypass the cache read (still writes). Default `false`. |
+Header `X-API-Key: <key>` is required. `refresh=true` bypasses the cache.
 
-Headers: `X-API-Key: <key>` (required).
+Accepts any of: `https://www.linkedin.com/in/{slug}`, with or without trailing slash,
+query string, locale prefix, or `http://`. Also accepts a bare slug.
 
-### `GET /v1/profile?url=...&refresh=false`
+**200** — the profile. Top-level keys:
 
-Convenience form for curl demos. Same response, same auth.
+```
+meta, profile, experience, education, skills, certifications,
+languages, projects, publications, honors, volunteer, courses
+```
 
-### `GET /v1/health` (unauthenticated)
+Real output, from `OFFLINE_MODE=true` against the `barackobama` fixture:
 
-```json
+```jsonc
 {
-  "status": "ok",
-  "version": "0.1.0",
-  "sessions": { "total": 2, "available": 2, "cooling": 0 },
-  "redis": true,
-  "has_api_key": true
+  "meta": {
+    "profile_url": "https://www.linkedin.com/in/barackobama",
+    "public_identifier": "barackobama",
+    "profile_urn": "ACoAAAC2EzMB7j1OC2l5XFXf1vNlYdp8HaZcSr4",
+    "fetched_at": "2026-08-30T22:05:16Z",
+    "source": "flagship_web_rsc",    // which strategy served this
+    "supplemented_by": [],           // strategies that filled gaps
+    "cache": { "hit": false, "age_seconds": 0, "stale": false },
+    "partial_sections": [],          // mappers that degraded, by name
+    "completeness": 0.71,            // 0-1, how much of the schema was populated
+    "request_id": "0163b4f574247f45"
+  },
+  "profile": {
+    "first_name": null, "last_name": null, "full_name": "Barack Obama",
+    "headline": "Former President of the United States of America",
+    "about": null,
+    "location": { "raw": "Washington, District of Columbia, United States",
+                  "city": null, "region": null, "country": null, "country_code": null },
+    "industry": null, "pronouns": null,
+    "flags":  { "premium": false, "influencer": false, "open_to_work": false, "hiring": false },
+    "images": { "profile": [ { "url": "https://media.licdn.com/dms/image/v2/D4E03AQGcice3q3BiUQ/…",
+                               "width": 100, "height": 100 } ],
+                "background": [] },
+    "counts": { "followers": null, "connections": null }
+  },
+  "experience": [
+    {
+      "title": "President of the United States of America",
+      "employment_type": null,
+      "company": { "name": "White House", "urn": null, "linkedin_url": null, "logo": null },
+      "location": null,
+      "location_type": null,
+      "start": { "year": 2009, "month": 1, "day": null, "iso": "2009-01" },
+      "end":   { "year": 2017, "month": 1, "day": null, "iso": "2017-01" },
+      "is_current": false,
+      "duration_months": 96,
+      "description": null,
+      "skills": []
+    }
+  ]
 }
 ```
 
-No token material is ever exposed. `sessions.total` is the count of `li_at` cookies
-configured; `cooling` is how many are in cooldown after a challenge or rate limit.
+Education and certifications, from the `rajstriver` capture:
 
-### `GET /docs`
-
-FastAPI OpenAPI / Swagger UI. Interactive; try the endpoints in the browser.
-
-### Response shape
-
-The full schema is in `app/models.py` and is rendered at `/docs`. The top-level shape:
-
-```
-meta:        { profile_url, public_identifier, profile_urn, fetched_at, source,
-               supplemented_by, cache, partial_sections, completeness, request_id }
-profile:     { first_name, last_name, full_name, headline, about, location,
-               industry, pronouns, flags, images, counts }
-experience:  [{ title, employment_type, company, location, start, end, is_current,
-               duration_months, description, skills }]
-education:   [{ school, school_urn, school_logo, degree, field_of_study, grade,
-               start, end, activities, description }]
-skills:      [{ name, endorsement_count }]
-certifications: [{ name, authority, license_number, url, issued, expires }]
-languages:   [{ name, proficiency }]
-projects, publications, honors, volunteer, courses: [...]
+```jsonc
+  "education": [
+    { "school": "Jalpaiguri Government  Engineering College",
+      "degree": "B.TECH", "field_of_study": "Information Technology",
+      "start": { "year": 2016, "iso": "2016" }, "end": { "year": 2020, "iso": "2020" } }
+  ],
+  "certifications": [
+    { "name": "Algorithmic Toolbox", "authority": "Coursera",
+      "license_number": "RKYYD4NET8ZR",
+      "issued": { "year": 2017, "month": 10, "iso": "2017-10" }, "expires": null }
+  ]
 ```
 
-Design rules, enforced in the models:
-- **Collections are always arrays, never `null`.** Absent and empty are different
-  states; consumers should not have to branch on `null`.
-- **Dates are objects, not strings.** `{year, month, day, iso}` — `day` is `null`
-  when LinkedIn only gives year/month. We never invent a day.
-- **`meta.source` and `meta.partial_sections`** make the response self-describing. A
-  consumer can tell whether it got the rich GraphQL path or the degraded public-HTML
-  fallback without guessing.
-- **`completeness`** = populated core fields / expected core fields, rounded to 2
-  places. Core: `full_name`, `headline`, `location`, `about`, `experience`,
-  `education`, `skills`.
-- **Image URLs carry `expires_at`.** LinkedIn media CDN URLs are signed and
-  time-limited; surfacing the expiry prevents consumers from caching a dead link.
+**Design notes on the schema.** Every section is a list and is always present, empty
+rather than absent, so a consumer never branches on key existence. Dates are structured
+(`year`/`month`/`day`) *and* pre-formatted (`iso`), because LinkedIn's own precision
+varies — `"2016"` and `"2024-08"` are both faithful, and forcing a full date would invent
+information. `meta.completeness` and `meta.partial_sections` make degradation legible
+instead of silent: a caller can tell an empty `skills` list caused by a private profile
+apart from one caused by a broken mapper.
+
+### `GET /v1/health` — unauthenticated
+
+```json
+{ "status": "ok", "version": "0.1.0",
+  "sessions": { "total": 1, "available": 1, "cooling": 0 },
+  "redis": true, "has_api_key": true }
+```
+
+Safe to expose publicly: it reports session *counts*, never token material. If it ever
+contains a cookie, that is a bug.
+
+### `GET /docs` — OpenAPI / Swagger UI.
 
 ### Error codes
 
-| Code | HTTP | Meaning |
+| HTTP | `error.code` | Meaning |
 |---|---|---|
-| `INVALID_URL` | 400 | Not a LinkedIn profile URL (company, school, empty, non-linkedin host) |
-| `UNAUTHORIZED` | 401 | Missing or wrong `X-API-Key` |
-| `PROFILE_NOT_FOUND` | 404 | No data found via any strategy |
-| `PROFILE_PRIVATE` | 403 | Profile is private / out-of-network |
-| `UPSTREAM_CHALLENGE` | 502 | LinkedIn returned a challenge / 999 |
-| `ALL_SESSIONS_COOLING` | 503 | Every session in the pool is in cooldown |
-| `RATE_LIMITED` | 429 | LinkedIn rate-limited the request |
-| `MISSING_QUERY_ID` | 500 | A required value in `queries.yaml` is still a placeholder |
-| `INTERNAL` | 500 | Unexpected error |
+| 400 | `INVALID_URL` | Not a parseable LinkedIn profile URL |
+| 401 | `UNAUTHORIZED` | Missing or wrong `X-API-Key` |
+| 403 | `PROFILE_PRIVATE` | Profile exists but is not visible to this session |
+| 404 | `PROFILE_NOT_FOUND` | No data from any strategy |
+| 429 | `RATE_LIMITED` | Client-side rate limit |
+| 500 | `MISSING_QUERY_ID` | A `queries.yaml` value is still a placeholder |
+| 502 | `UPSTREAM_CHALLENGE` | LinkedIn challenged the session (999 / checkpoint) |
+| 503 | `ALL_SESSIONS_COOLING` | Every session is in cooldown |
 
-Every error body:
 ```json
-{ "error": { "code": "PROFILE_NOT_FOUND", "message": "...", "request_id": "01J9..." } }
+{ "error": { "code": "PROFILE_NOT_FOUND",
+             "message": "no data found for slug 'x' via any strategy",
+             "request_id": "01bc9b5f602b114c" } }
 ```
-
-Every response carries an `X-Request-ID` header matching `meta.request_id`.
 
 ---
 
 ## Approach
 
-### How the endpoints were found
+### Finding the endpoints
 
-HAR capture from an authenticated LinkedIn session using browser devtools. This is
-**recon only** — the browser is used to *discover* the endpoint shapes, then the
-solution talks to those endpoints directly via HTTP. The brief forbids browsers in
-the *solution*; it does not forbid them in *recon*, and using them for recon is exactly
-how reverse engineering works. The browser appears nowhere in the runtime, the Dockerfile,
-or any runtime dependency.
+Full technical detail is in **[docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md)**.
+The short version:
 
-### The transport: flagship-web RSC (what LinkedIn actually uses now)
+LinkedIn has been through three profile APIs and all three still answer requests — which
+is misleading, because two of them answer with tombstones. `profileView`, `skills`, and
+`educations` return `410 Gone`. Dash returns real data for a couple of calls and then
+401s on a quota. GraphQL needs a `queryId` that rotates every frontend deploy. What
+survives is `positionGroups` (experience) and the flagship RSC card components
+(everything).
 
-Analyzing the captured HAR revealed that **LinkedIn has migrated profile rendering from
-Voyager REST/GraphQL to flagship-web RSC (React Server Components)**. The Voyager
-endpoints documented in older reverse-engineering work (`/voyager/api/identity/profiles/`,
-`/voyager/api/graphql?queryId=...`) are either deprecated or return empty responses in
-current production traffic.
+### The three findings that mattered
 
-The live LinkedIn web app now fetches profile data through:
-1. `GET /flagship-web/in/{slug}/` — the main page, a base64-encoded RSC stream containing
-   the profile header (name, headline, education summary, photos, profile URN)
-2. `GET /flagship-web/rsc-action/actions/component?componentId=...profileCardsExperienceOnly`
-   — the experience section, a base64-encoded RSC stream with positions, companies, dates
-3. `GET /flagship-web/rsc-action/actions/component?componentId=...profileCardsBelowActivityPart4`
-   — the languages section (and other BelowActivity parts for skills, certifications, etc.)
+Each of these presents as "the account is banned". None of them is.
 
-The RSC wire format is a line-based protocol: each line is `id:type,json_payload`, where
-type `I` is a component import, type `T` is text/blob data, and type `[` is a component
-tree array. The component trees are HTML-like structures:
-`["$","p",null,{"children":["Analyst"]}]` — a `<p>` element with text content "Analyst".
+**1. A pinned `cookie` header causes infinite redirects.** LinkedIn answers identity
+endpoints with a 302 to *the same URL* carrying `Set-Cookie: lidc=…` — datacenter
+affinity. Setting `cookie` as a request header overrides curl's jar, so `lidc` is never
+replayed and the request loops until curl aborts at 30 hops. Cookies must live in a jar,
+with redirects followed. `build_headers()` deliberately sets no `cookie` key and a test
+asserts it never does.
 
-**The RSC parser (`app/linkedin/rsc_parser.py`) decodes the base64, parses the line-based
-wire format, and walks the component tree depth-first to extract a flat list of
-human-readable text strings in document order.** The strategy then pattern-matches this
-text list (using date regexes, employment-type sets, location patterns) to reconstruct
-structured profile data.
+**2. Cookie domain scope is load-bearing.** `li_at` on `.linkedin.com` reproduces the
+redirect loop; the same value on `.www.linkedin.com` returns data. The scopes a browser
+uses are encoded in `COOKIE_DOMAINS`.
 
-This is the intellectual core of the submission, updated for LinkedIn's current transport.
-The old Voyager endpoints and the URN graph resolver are kept as fallbacks — they still
-work if LinkedIn rolls back or if the RSC endpoints are unavailable.
+**3. `li_at` rotates during normal use.** Three exports taken minutes apart had three
+different values. A fresh cookie works for one or two requests, then everything 401s —
+indistinguishable from a ban unless you know to look. So the client harvests rotated
+cookies from the jar after every response, persists them to a gitignored
+`.cookie_state.json` (0600, atomic write, refuses to truncate itself), and **serializes
+requests per session** so two in-flight calls cannot race the rotation. Different
+sessions still run concurrently.
 
-### Why all three Voyager generations are still supported
+### Why `curl_cffi`
 
-Even though the HAR shows RSC is the current transport, the three Voyager generations
-(legacy REST, dash, GraphQL) are kept in the strategy chain as fallbacks. They break at
-different times, and supporting all three means the API degrades gracefully:
-- **Flagship-web RSC** (primary) — what the live app uses now
-- **GraphQL** (fallback 1) — needs a `queryId` that rotates; highest fidelity when available
-- **Dash** (fallback 2) — needs a `decorationId`; resolves slug to URN for GraphQL
-- **Legacy REST** (fallback 3) — no queryId needed; most reliable Voyager path
-- **Public HTML** (last resort) — unauthenticated JSON-LD; always available
+A plain `requests`/`httpx` TLS handshake is trivially distinguishable from Chrome's.
+`curl_cffi` reproduces Chrome's JA3 and HTTP/2 fingerprint. The impersonation target is
+kept aligned with the `User-Agent` the app sends — claiming Chrome 152 over a Chrome 124
+handshake is itself a cheap bot signal.
 
-### The normalized envelope and the URN graph (Voyager fallback path)
+### The fallback chain
 
-With `accept: application/vnd.linkedin.normalized+json+2.1`, Voyager responses are a graph:
-
-```json
-{
-  "data": {
-    "*profile": "urn:li:fs_profile:ACoAA...",
-    "*elements": ["urn:li:fs_position:(ACoAA...,1)", "urn:li:fs_position:(ACoAA...,2)"]
-  },
-  "included": [
-    { "entityUrn": "urn:li:fs_position:(ACoAA...,1)", "$type": "...Position", "title": "Engineer", "*company": "urn:li:fs_miniCompany:1234" },
-    { "entityUrn": "urn:li:fs_miniCompany:1234", "$type": "...MiniCompany", "name": "Acme" }
-  ]
-}
-```
-
-`data` is a graph of URN pointers (star-keys `*foo` hold URN references); `included`
-is a flat pool of every entity. The URN graph resolver (`app/normalize/urn_graph.py`)
-is pure (no I/O, no async) and handles cycles via a `seen` frozenset, depth caps, and
-a `by_type()` escape hatch. This is kept for the Voyager fallback path.
-
-### Why `curl_cffi` and TLS fingerprinting
-
-LinkedIn fingerprints the TLS handshake (JA3) and HTTP/2 frame ordering. A stock
-Python HTTP client (`requests`, `httpx`) has a fingerprint that matches no browser,
-which sharply increases the rate of challenge responses (HTTP 999, redirect to
-`/checkpoint/challenge`). `curl_cffi` with `impersonate="chrome124"` reproduces
-Chrome's TLS handshake and H2 frame ordering at the libcurl level — not a browser,
-just a TLS fingerprint match. This is a load-bearing decision: without it, the
-challenge rate against a burner account is high enough to make the API unusable
-during a grading window.
-
-### The fallback and supplementation chain
-
-The orchestrator runs strategies in order: **GraphQL > dash > legacy > public-HTML**.
-
-1. The first strategy returning a parseable payload becomes the primary. Its name
-   goes in `meta.source`.
-2. If the primary populated all core sections (`profile`, `experience`, `education`),
-   stop.
-3. If sections are missing and a lower-priority strategy declares it can provide
-   them, call it and merge — but only into empty sections. A populated field is
-   authoritative; a lower-priority strategy never overwrites it. Supplements go in
-   `meta.supplemented_by`.
-4. If a strategy raises `ConfigError` (its `queryId` / `decorationId` is still a
-   placeholder), log a warning and skip it. The chain continues. A missing queryId
-   degrades, it never 500s.
-5. If every strategy fails, serve a stale cache entry with `meta.cache.stale = true`
-   before erroring — the endpoint never looks broken during grading.
-
-### Architecture
+Strategies run in order, and merging is **additive only** — a lower-priority strategy
+fills empty fields and never overwrites populated ones.
 
 ```
-                    ┌──────────────────────────────┐
-    POST /v1/profile│  FastAPI app                 │
-    ──────────────► │  auth (API key) → validate   │
-                    │  → normalise URL to slug     │
-                    └──────────────┬───────────────┘
-                                   │
-                         ┌─────────▼─────────┐
-                         │  Cache (Redis)    │  key: slug, TTL 24h, stale-on-error
-                         └─────────┬─────────┘
-                                   │ miss
-                         ┌─────────▼──────────────────────┐
-                         │  Fetch orchestrator            │
-                         │  strategy chain, first success │
-                         └─────────┬──────────────────────┘
-                      ┌────────────┼────────────┐
-                      ▼            ▼            ▼
-               GraphQL cards  dash profiles  legacy profileView  → public HTML/JSON-LD
-                      └────────────┼────────────┘
-                         ┌─────────▼─────────┐
-                         │  Session manager  │  cookie pool, health, cooldown
-                         └─────────┬─────────┘
-                         ┌─────────▼─────────┐
-                         │  Rate limiter     │  token bucket + jittered delay
-                         └─────────┬─────────┘
-                                   ▼
-                         ┌───────────────────┐
-                         │  URN graph resolver│  pure, fixture tested
-                         └─────────┬─────────┘
-                         ┌─────────▼─────────┐
-                         │  Section mappers  │  each independently failable
-                         └─────────┬─────────┘
-                         ┌─────────▼─────────┐
-                         │  Pydantic models  │  → stable public schema
-                         └───────────────────┘
+flagship_web_rsc   complete profile, needs web-app auth
+voyager_rest       experience + URN; the universal path, works today
+voyager_graphql    needs a real queryId; ConfigError → skipped
+voyager_dash       needs a real decorationId; ConfigError → skipped
+public_html        unauthenticated last resort
 ```
+
+Three invariants make this robust, all learned the hard way:
+
+- **A strategy that cannot run is skipped, never fatal.** A missing `queryId` logs a
+  warning and the chain continues.
+- **One failed sub-request does not abort a strategy.** `voyager_rest` fetches ten
+  endpoints; the earlier version returned `None` if the first failed, discarding
+  experience data it had already retrieved.
+- **A transport failure never cools a shared session.** An empty RSC parse says nothing
+  about session health, and cooling on it starved the Voyager strategies that would have
+  succeeded on the same session. Sessions cool on auth signals only.
 
 ---
 
-## Known limitations
+## Architecture
 
-Be specific and unflinching — a reviewer who has operated one of these reads this
-section first.
-
-### The RSC transport is undocumented and will change
-
-LinkedIn's flagship-web RSC (React Server Components) transport is an internal
-implementation detail, not a public API. The wire format, component IDs, and text
-layout can change with any frontend deploy. The RSC parser (`app/linkedin/rsc_parser.py`)
-and the text pattern-matching mappers (`app/linkedin/strategies/flagship_web.py`) are
-built against the format observed in the captured HAR. When LinkedIn changes the
-component layout, the mappers will need adjustment — but the parser's text-extraction
-approach is resilient to structural changes (it walks the tree, it doesn't hardcode
-paths).
-
-### GraphQL `queryId` hashes rotate (Voyager fallback path)
-
-GraphQL `queryId` values are persisted-query identifiers that rotate with LinkedIn
-frontend deploys. This *will* break the GraphQL strategy, usually every few weeks.
-
-**The fix is one file and one command:**
-```bash
-python scripts/extract_query_ids.py capture.har
-# paste the printed values into app/linkedin/queries.yaml
 ```
-The dash and legacy strategies do not need queryIds, so the API keeps working via
-fallback — the GraphQL strategy just stops being the primary.
+app/
+  main.py                  FastAPI app, routes, mapper isolation
+  config.py                typed settings; cookie parsing + domain map
+  models.py                the response schema (pydantic)
+  errors.py                typed errors → HTTP codes
+  cache.py                 Redis cache, stale-on-error fallback
+  ratelimit.py             client-side limiter
+  linkedin/
+    client.py              curl_cffi transport, per-session jars, classification
+    cookie_store.py        rotated-credential persistence
+    session.py             session pool: LRU, cooldown, rotation
+    orchestrator.py        strategy chain + additive merge
+    rsc_parser.py          RSC wire format → flat text
+    endpoints.py           URL builders (incl. Rest.li encoding)
+    strategies/            one module per generation
+  normalize/
+    urn_graph.py           resolves star-key URN references
+    sections/              one mapper per profile section
+```
 
-### Sessions get challenged and restricted
+Invariants worth knowing before editing:
 
-LinkedIn issues HTTP 999, challenge redirects, and eventually restricts accounts that
-hit Voyager at machine cadence. The session pool mitigates this — it rotates cookies,
-cools a session after a hard failure, and uses exponential backoff for soft failures —
-but it does not *solve* it. Use a burner account created and warmed for this. Do not
-put a real LinkedIn `li_at` into a public deployment.
-
-### Datacenter IPs are flagged harder than residential
-
-A Fly.io VM has a datacenter IP. LinkedIn flags datacenter IPs more aggressively than
-residential ones, which raises the challenge rate. A proxy hook exists
-(`HTTP_PROXY_URL` in `.env.example`) and is unused in the demo deployment. Adding a
-residential proxy is the single biggest reliability improvement you can make.
-
-### Private and out-of-network profiles return reduced data
-
-This is by design. LinkedIn shows less data for profiles outside your network, and
-less still for private profiles. The API reports this honestly via `completeness`
-and `partial_sections` rather than faking fields. A profile that returns
-`completeness: 0.4` is telling you the truth: it got the degraded path, not the rich
-one.
-
-### Contact info is deliberately not fetched
-
-The `/contact-info` endpoint exists and the auth ritual is the same. The API does not
-call it. This is a deliberate data-minimisation choice: email and phone are more
-sensitive than work history, and the profile brief does not require them. Documented
-as a choice, not an omission.
-
-### Legal
-
-This violates LinkedIn's User Agreement, which prohibits automated access and
-scraping. *hiQ v. LinkedIn* held that scraping public data does not violate the CFAA,
-but that holding does not extend to authenticated access to internal endpoints.
-Built for evaluation at Tross's explicit direction, not for production use.
+- **`app/normalize/` never imports `app/linkedin/`.** The normalizer is pure and takes a
+  dict, which is what makes the whole suite runnable offline.
+- **Every section mapper is independently failable.** A raising mapper yields an empty
+  section and its name in `meta.partial_sections`. One bad mapper never 500s a request.
+- **`urn_graph.py` has no I/O, no async, no config.**
+- **`health()` output is safe to expose publicly.**
 
 ---
 
 ## Testing
 
-The whole suite runs offline against saved fixtures. No LinkedIn account needed.
-
 ```bash
-uv venv && uv pip install -e ".[dev]"
-pytest -q          # 154 tests, ~1s, zero network
+pytest -q          # 230 tests, no network access required
+ruff check app tests
 ```
 
-The test suite mechanically enforces the no-network rule: a conftest fixture patches
-`socket.connect` to raise `AssertionError` for any `AF_INET`/`AF_INET6` connection.
-AF_UNIX is allowed (asyncio's event loop uses it internally). A test that accidentally
-introduces a network dependency fails immediately with a clear message.
+The suite runs with **zero network**. There is no VCR cassette and no mocking of our own
+HTTP layer pretending to be a test — the mappers are exercised against real captured
+LinkedIn payloads in `tests/fixtures/`, and the transport logic is exercised against
+synthesised responses through the pure `classify()` function.
 
-Section mappers have two layers of tests:
-- **Synthetic** tests in `tests/test_sections.py` exercise the baseline field paths
-  against payloads matching the documented normalized-envelope shape. These run now.
-- **Fixture** tests (added when a HAR arrives) read redacted payloads from
-  `tests/fixtures/` and verify the same outputs. When a fixture and the baseline
-  disagree, the fixture wins and a code comment records the divergence.
+The fixture-backed mapper tests double as the calibration record. `tests/test_rsc_mappers.py`
+asserts the exact positions, schools, and certifications that a real capture contains, so
+a LinkedIn format change fails there rather than silently emptying a section in
+production. Some of those assertions encode specific traps:
 
-The URN graph resolver (`tests/test_urn_graph.py`) exercises the five required cases:
-single reference, list reference, nested reference two levels deep, missing URN, and
-a reference cycle (which must terminate, not recurse infinitely).
+- honors (`"Issued by X · Jan 2019"`) must not be parsed as certifications
+- education date ranges must not be parsed as jobs, *and* year-only ranges that really
+  are jobs must survive
+- role descriptions must not be parsed as job titles
+
+`tests/test_cookies.py` covers the credential-rotation logic, including that the cookie
+store refuses to write itself empty over good state.
+
+> **Fixtures contain real third-party profile data**, redacted of credentials. They are
+> present for calibration and offline testing. `tests/fixtures/rsc/profile_rajstriver.json`
+> is from a HAR supplied for this project.
+
+---
+
+## Known limitations
+
+Written the way an operator would want to read them.
+
+### The flagship RSC path needs web-app auth
+
+The largest limitation, covered in [Status](#status-what-works-today). Name, headline,
+about, education, skills, certifications, and languages all come from this transport.
+The implementation is complete and fixture-verified; it is the session that is the
+blocker. **If you supply cookies from a session that can load `linkedin.com/feed/` in a
+browser, this path should light up with no code change** — that is the first thing to
+test with a different account.
+
+### `queryId` / `decorationId` rotate with every frontend deploy
+
+`app/linkedin/queries.yaml` ships placeholders. The GraphQL and dash strategies raise
+`ConfigError`, log it, and are skipped — the API keeps working without them.
+
+To refresh, from a HAR of a **profile** page (a feed capture only yields feed and
+messaging ids):
+
+```bash
+python scripts/extract_query_ids.py capture.har
+# paste the printed values into app/linkedin/queries.yaml
+```
+
+Extracting them from LinkedIn's JS bundles instead was attempted and is a dead end for
+profile ids: the guest bundles reachable from `/login` (14 files, ~3.9 MB) contain none,
+and the authenticated flagship bundles are only discoverable from an authenticated page.
+
+### The RSC format is undocumented and will change
+
+It is a UI description, not an API contract — LinkedIn owes no stability here. The card
+mappers pattern-match over pooled text because the `BelowActivityPartN` bucket names are
+meaningless and unstable. When a section goes quiet, re-capture and re-calibrate; the
+mapper tests will tell you what moved.
+
+One known gap: a position whose title is not recoverable from the flattened stream is
+dropped rather than guessed at. On the calibration capture that costs one of seven
+positions (a sub-role whose title text is not adjacent to its date line). Emitting a
+description as a job title would be worse than omitting the row.
+
+### Sessions get challenged, and `li_at` rotates
+
+Expect `999` and checkpoint challenges under load. The pool cools a session for
+`SESSION_COOLDOWN_SECONDS` on a hard failure and rotates to the next. With a single
+session, a challenge means downtime until it clears.
+
+Because `li_at` rotates, **a human browsing LinkedIn on the same account will rotate the
+credential out from under the API.** For a stable demo, export cookies and then leave the
+account alone.
+
+### `dash/profiles` is quota-limited
+
+It returns real data for roughly the first couple of calls per window and then 401s. The
+profile URN is recovered from position URNs (`urn:li:fs_position:(<profileId>,…)`) when
+that happens, so URN resolution survives the quota.
+
+### Datacenter IPs are flagged harder
+
+The politeness defaults (`MIN_DELAY_MS`/`MAX_DELAY_MS`, `MAX_CONCURRENCY=2`) are tuned
+for self-preservation, not throughput. `HTTP_PROXY_URL` is wired for a residential proxy
+but unused in the demo deployment.
+
+### Private and out-of-network profiles return reduced data
+
+Handled as partial data with the sections named in `meta.partial_sections`, not as an
+error.
+
+### Contact info is deliberately not fetched
+
+`/profileContactInfo` exposes email and phone. Fetching it is a meaningful privacy
+escalation beyond what the challenge asks for, so it is not implemented. This is a
+choice, not an oversight.
+
+### Legal
+
+Automated collection of LinkedIn profiles is contrary to LinkedIn's User Agreement, and
+the ethics differ from the legality. This exists as a technical exercise against a burner
+account. It is not something to point at a production workload without independent legal
+review and a data-protection basis for whatever you do with the output.
 
 ---
 
 ## Security
 
-- **No secrets in the repo.** `.env` is gitignored from the first commit. `.env.example`
-  documents every variable with empty values. A secret sweep (`gitleaks`, plus
-  `grep -ri "li_at\|jsessionid" --include="*.py" --include="*.json" .`) finds only
-  variable names and redaction patterns, never a value.
-- **Env-only config.** `pydantic-settings` reads from `os.environ` and `.env`; nothing
-  is hardcoded.
-- **API key.** `X-API-Key` header, compared with `hmac.compare_digest` (constant time).
-  `/health` and `/docs` are unauthenticated; everything else requires the key.
-- **PII-safe logging.** structlog with a `redact` processor that drops any key matching
-  `cookie|li_at|jsessionid|csrf|authorization|api_key` (and a few more) before rendering.
-  Logs contain profile slugs and request IDs; never cookies, response bodies, names,
-  or emails.
-- **Cache TTL as data minimisation.** The 24h cache TTL is also the maximum time a
-  profile blob persists. There is no persistent profile database; Redis is the only
-  store and entries expire.
-- **Fixture redaction.** `scripts/har_to_fixtures.py` strips `Cookie`/`Set-Cookie`
-  headers and redacts `email|phoneNumber|address|birthDate` keys before writing any
-  fixture. The script prints a warning that fixtures contain real third-party profile
-  data and the human should review before committing.
+- **No secrets in the repo.** `.env` and `.cookie_state.json` are gitignored. Fixtures
+  are swept for credentials before they land.
+- **The runtime cookie store holds live credentials.** Written `0600`, atomically, and
+  never logged.
+- **No PII in logs.** Slugs and request ids, yes; cookies, response bodies, and names, no.
+- **`X-API-Key` on every profile route.** `/v1/health` is deliberately open and reports
+  no token material.
+
+Before any commit touching fixtures or config:
+
+```bash
+gitleaks detect --no-git
+grep -ri "li_at\|jsessionid" --include="*.py" --include="*.json" .
+```

@@ -1,0 +1,16 @@
+# Keep the deployment lean and free of anything sensitive.
+.venv/
+.git/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+tests/
+docs/
+scripts/
+*.har
+.env
+.env.*
+.cookie_state.json
+*.pdf
+BUILD_SPEC.md
+tross-linkedin-api-plan.md

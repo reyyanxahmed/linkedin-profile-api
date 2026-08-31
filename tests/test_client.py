@@ -68,9 +68,23 @@ class TestBuildHeaders:
         h = build_headers(s)
         # csrf-token has the bare value (no quotes).
         assert h["csrf-token"] == "ajax:123"
-        # cookie has the value WITH surrounding quotes.
-        assert 'JSESSIONID="ajax:123"' in h["cookie"]
-        assert "li_at=tok" in h["cookie"]
+
+    def test_no_pinned_cookie_header(self) -> None:
+        """Cookies belong in curl's jar, never in a pinned header.
+
+        A pinned `cookie` header overrides the jar, so the `lidc` cookie LinkedIn
+        sets on its 302 affinity hop is never replayed and the request redirects to
+        itself until curl aborts. This assertion is the regression guard.
+        """
+        s = Session(li_at="tok", jsessionid="ajax:123")
+        assert "cookie" not in {k.lower() for k in build_headers(s)}
+
+    def test_cookie_list_quotes_jsessionid(self) -> None:
+        # The cookie value carries quotes even though config stores it bare.
+        s = Session(li_at="tok", jsessionid="ajax:123")
+        by_name = {c.name: c.value for c in s.cookie_list()}
+        assert by_name["JSESSIONID"] == '"ajax:123"'
+        assert by_name["li_at"] == "tok"
 
     def test_accept_header_is_normalized_envelope(self) -> None:
         s = Session(li_at="tok", jsessionid="ajax:123")

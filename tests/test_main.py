@@ -45,11 +45,13 @@ class TestHealth:
         assert r.status_code == 200
         body = r.json()
         assert body["status"] == "ok"
-        # Honest state: empty pool, redis absent.
+        # Honest state: empty pool, memory cache (no redis reachable).
         assert body["sessions"]["total"] == 0
         assert body["sessions"]["available"] == 0
         assert body["sessions"]["cooling"] == 0
-        assert body["redis"] is False
+        # Reports the backend actually serving, not merely what was configured:
+        # a configured-but-unreachable Redis must still report "memory".
+        assert body["cache"] == "memory"
 
     async def test_health_has_no_token_material(self, client) -> None:
         r = await client.get("/v1/health")

@@ -64,14 +64,20 @@ def build_strategies(queries: dict, offline_mode: bool = False, fixture_dir: str
     transport). Voyager strategies (GraphQL, dash, legacy) are kept as fallbacks
     in case RSC is unavailable or returns partial data.
 
-    In offline_mode with fixture_dir set, the FlagshipWebStrategy serves from saved
-    RSC fixtures on disk instead of hitting LinkedIn — no network needed.
+    In offline_mode the chain is ONLY the fixture-backed FlagshipWebStrategy, which
+    serves saved RSC fixtures from disk. No strategy in the returned chain opens a
+    socket, so OFFLINE_MODE=true is a hard guarantee rather than a preference.
 
     Strategies with placeholder config still get constructed; they raise ConfigError
     at fetch time (caught by the orchestrator) and degrade to the next strategy.
     """
     graphql_cfg = queries.get("graphql", {}) or {}
     dash_cfg = queries.get("dash", {}) or {}
+    if offline_mode:
+        # Offline means offline. The fixture-backed strategy is the only one that
+        # can run without a socket; including the others would quietly make live
+        # LinkedIn calls in a mode whose whole promise is that it makes none.
+        return [FlagshipWebStrategy(offline_mode=True, fixture_dir=fixture_dir)]
     return [
         FlagshipWebStrategy(offline_mode=offline_mode, fixture_dir=fixture_dir),
         GraphQLStrategy(graphql_cfg.get("profile_cards_query_id", "")),
@@ -113,6 +119,7 @@ class Orchestrator:
         flagship_result: FetchResult | None = None
         for strat in self.strategies:
             if isinstance(strat, FlagshipWebStrategy):
+                r = None
                 try:
                     r = await strat.fetch(slug, client)
                 except Exception as e:
@@ -127,6 +134,7 @@ class Orchestrator:
         voyager_result: FetchResult | None = None
         for strat in self.strategies:
             if isinstance(strat, LegacyStrategy):
+                r = None
                 try:
                     r = await strat.fetch(slug, client)
                 except Exception as e:
