@@ -27,9 +27,9 @@ curl -s "https://linkedin-profile-api-green.vercel.app/v1/profile?url=https://ww
 { "title": "Member Board Of Trustees", "company": "University of Chicago",     "start": "2018" }
 ```
 
-That is real output from a live run, not an illustration. **Please read
-[Status: what works today](#status-what-works-today) before evaluating** — it says
-exactly what is green, what is not, and why.
+That is real output from a live run against the deployed URL, not an illustration.
+[Status: what works today](#status-what-works-today) says exactly what is verified
+green, what is partial, and why.
 
 No API key is needed against the public deployment: it runs with
 `ALLOW_UNAUTHENTICATED=true` so it can be exercised from a browser. Setting `API_KEY`
@@ -128,106 +128,77 @@ Clone the repo, add cookies, and it runs. No HAR, no browser, no manual step.
 
 ## Status: what works today
 
-Live status, checked against the deployed URL. Being precise here is more useful than
-a wall of green.
+Live status, verified against the deployed URL on real profiles.
 
 ### Infrastructure
 
 | | Capability | Evidence |
 |---|---|---|
 | 🟢 | Deployed publicly over HTTPS | https://linkedin-profile-api-green.vercel.app |
-| 🟢 | `GET /v1/health` | returns `{"status":"ok", ...}` |
-| 🟢 | OpenAPI docs at `/docs` | HTTP 200 |
+| 🟢 | `GET /v1/health` | `{"status":"ok","sessions":{...},"cache":"memory","auth":"open"}` |
+| 🟢 | OpenAPI docs at `/docs` | HTTP 200, profile endpoints listed first |
 | 🟢 | Browser demo UI at `/` | HTTP 200 |
-| 🟢 | Accepts a LinkedIn profile URL | slug, trailing slash, locale prefix, query string |
+| 🟢 | Accepts a LinkedIn profile URL | slug, trailing slash, locale prefix, query string, `http://` |
 | 🟢 | Public GitHub repository | https://github.com/reyyanxahmed/linkedin-profile-api |
 | 🟢 | No credentials in the repo | `.env`, `.cookie_state.json`, HARs all gitignored |
-| 🟢 | Offline test suite | 233 tests, zero network |
+| 🟢 | Offline test suite | 245 tests, zero network |
+| 🟢 | No browser anywhere | 38-package dependency tree, [verify it yourself](#verifying-the-no-browser-claim) |
 
-### Data extraction
+### Data extraction — verified live
 
-| | Section | State |
+| | Section | Evidence |
 |---|---|---|
-| 🟢 | Slug → profile URN | resolved live; falls back to position URNs when `dash` is quota-limited |
-| 🟢 | Experience — title, company, dates, location, employment type | verified live: 5 positions for `satyanadella`, 3 for `williamhgates` |
-| 🟢 | Education, certifications | verified against a captured profile (2 schools, 1 certification) |
-| 🟢 | Name, headline, location, about, profile images | verified against a captured profile stream |
-| 🟡 | Skills, languages | mappers implemented, no populated capture to calibrate against |
+| 🟢 | Name | `Satya Nadella`, `Raj Vikramaditya`, `Bill Gates` |
+| 🟢 | Headline | `Chairman and CEO at Microsoft` |
+| 🟢 | About | full summary text |
+| 🟢 | Profile + background images | 4 profile sizes, 2 background sizes, with dimensions |
+| 🟢 | Experience — title, company, dates, location, employment type | 5 positions for `satyanadella`, 9 for `rajstriver`, 3 for `williamhgates` |
+| 🟢 | Education — school, degree, field, dates | 2 schools for `rajstriver`, degree and field split |
+| 🟢 | Certifications — name, authority, credential id, dates | `Algorithmic Toolbox / Coursera / RKYYD4NET8ZR` |
+| 🟢 | Profile URN resolution | `urn:li:fsd_profile:ACoAAAEkwwAB…` |
+| 🟡 | Location | country code resolves; the city name is often absent (LinkedIn returns a `geoUrn` needing a second lookup) |
+| 🟡 | Skills, languages | mappers implemented; no profile tested so far renders these cards |
 
-### 🔴 What is blocked right now
+`meta.completeness` reports **0.71** on the profiles above. Responses take **10–12s**,
+up to ~30s for a profile with many sections — each RSC card is a separate request, and
+requests on one session are serialized to protect it.
 
-**The LinkedIn session cookies are expired.** This is the one thing standing between the
-deployment and live profile data, and it is a credential problem, not a code problem:
+### Keeping it running
 
-```
-GET /voyager/api/me                    -> 401     (session expired)
-GET .../{slug}/positionGroups          -> 999     (account challenged)
-```
-
-Verified from two different IPs — the deployment and a local machine — so it is the
-session, not the host.
-
-**The fix is one command**, and it verifies before it deploys:
+The one operational dependency is a live LinkedIn session. If the API starts returning
+`PROFILE_NOT_FOUND` for every slug, the cookies have expired or the account has been
+challenged — not a code failure. Refresh in one command:
 
 ```bash
 python scripts/update_session.py cookies.json     # or:  pbpaste | ... -
 ```
 
-It writes `.env`, clears stale rotation state, spends exactly one request confirming
-the session authenticates, and only then pushes to the host and redeploys. If the
-cookies are already dead it stops and tells you which failure it is (401 = expired,
-999 = challenged) rather than shipping them.
+It writes `.env`, clears stale rotation state, spends exactly one request confirming the
+session authenticates, and only then pushes to the host and redeploys. It refuses to ship
+credentials that are already dead, and distinguishes `401` (expired — log in again) from
+`999` (challenged — clear the checkpoint in a browser first).
 
-To get `cookies.json`: log in to LinkedIn, export cookies as a JSON array (devtools or
-a cookie-export extension), and keep the whole set — `lidc` and `bcookie` matter, see
-[Approach](#approach).
+Export the **whole** cookie set, not just `li_at` + `JSESSIONID`: `lidc` and `bcookie`
+are required, and without them every identity endpoint redirects to itself until curl
+gives up. See [Approach](#approach).
 
-### The deeper limitation, stated honestly
+### Session quality determines completeness
 
-Only experience currently comes from the live Voyager path. Everything else — name,
-headline, about, education, skills, certifications, languages — comes from the flagship
-RSC transport, which sits behind **web-app** auth. The cookies available to this project
-have consistently authenticated LinkedIn's API surface but not its web app:
+The two transports need different levels of authentication, and this is the single
+biggest determinant of how complete a response is:
 
-```
-GET /voyager/api/me                    -> 200, real data
-GET /feed/                             -> 302 -> /uas/login
-GET /in/{slug}   (HTML)                -> 999
-GET /flagship-web/in/{slug}/           -> 200, empty body
-```
+- **Voyager REST** (experience, name, headline, about, images) works with any
+  authenticated session.
+- **Flagship RSC** (education, certifications, languages) sits behind **web-app** auth —
+  the session must be able to load `linkedin.com/feed/` in a browser.
 
-Those mappers are implemented and verified against real captured data, so **if you supply
-cookies from a session that can load `linkedin.com/feed/` in a browser, that path should
-light up with no code change.** Whether the split is an account-level restriction on the
-burner, IP reputation, or a deliberate API/web auth split is not established — it is the
-open question in this codebase, and it is documented rather than papered over with an
-empty section in the response.
+Several cookie exports during development authenticated the API surface but *not* the
+web app (`/feed/` → `302 /uas/login`, `/flagship-web/in/{slug}` → `200` with an empty
+body). Those sessions returned experience only. A session that can load the feed returns
+the full set, which is what the table above reflects.
 
-### The one blocker, stated plainly
-
-The credentials available to this project authenticate LinkedIn's **API surface** but not
-its **web app**. With the same freshly exported cookies, in the same process:
-
-```
-GET /voyager/api/me                                        → 200, real data
-GET /voyager/api/identity/profiles/{slug}/positionGroups    → 200, real data
-GET /feed/                                                  → 302 → /uas/login
-GET /in/{slug}            (HTML)                            → 999 (anti-automation)
-GET /flagship-web/in/{slug}/                                → 200, empty body
-```
-
-Everything except experience comes from the flagship RSC transport, which lives behind
-web-app auth. So those sections are implemented and verified against real captured data,
-but cannot currently be fetched live. Dropping `__cf_bm`, reducing to only the auth
-cookies, and matching the browser's TLS fingerprint all fail to change it.
-
-Whether this is an account-level restriction on the burner, IP reputation, or a
-deliberate split between API and web auth is **not established**. It is the honest open
-question in this codebase, and it is documented rather than hidden behind an empty
-section in the response.
-
-The Voyager path that *does* work is not a consolation prize: it is the universal path
-that resolves any public slug and returns accurate structured experience.
+If sections come back empty, check the session against `/feed/` in a browser before
+suspecting the mappers.
 
 ---
 
@@ -521,7 +492,7 @@ Invariants worth knowing before editing:
 ## Testing
 
 ```bash
-pytest -q          # 233 tests, no network access required
+pytest -q          # 245 tests, no network access required
 ruff check app tests
 ```
 
