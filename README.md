@@ -11,9 +11,11 @@ tree. Nothing shells out to a browser binary. See
 [Verifying the no-browser claim](#verifying-the-no-browser-claim) for how to check this
 yourself in about thirty seconds.
 
+**Live API:** https://linkedin-profile-api-green.vercel.app
+**Interactive docs:** https://linkedin-profile-api-green.vercel.app/docs
+
 ```bash
-curl -s -H "X-API-Key: $API_KEY" \
-  "http://localhost:8000/v1/profile?url=https://www.linkedin.com/in/satyanadella/" \
+curl -s "https://linkedin-profile-api-green.vercel.app/v1/profile?url=https://www.linkedin.com/in/satyanadella/" \
   | jq '.experience[] | {title, company: .company.name, start: .start.iso}'
 ```
 
@@ -26,9 +28,12 @@ curl -s -H "X-API-Key: $API_KEY" \
 ```
 
 That is real output from a live run, not an illustration. **Please read
-[Status: what works today](#status-what-works-today) before evaluating** — one section of
-the pipeline is blocked on an account-state problem, and this README is specific about
-which.
+[Status: what works today](#status-what-works-today) before evaluating** — it says
+exactly what is green, what is not, and why.
+
+No API key is needed against the public deployment: it runs with
+`ALLOW_UNAUTHENTICATED=true` so it can be exercised from a browser. Setting `API_KEY`
+re-enables `X-API-Key` enforcement, and always wins over that flag.
 
 ---
 
@@ -123,17 +128,80 @@ Clone the repo, add cookies, and it runs. No HAR, no browser, no manual step.
 
 ## Status: what works today
 
-Being precise about this is more useful than a green checkmark.
+Live status, checked against the deployed URL. Being precise here is more useful than
+a wall of green.
 
-| Capability | State | Evidence |
+### Infrastructure
+
+| | Capability | Evidence |
 |---|---|---|
-| Slug → profile URN resolution | **Live** | `urn:li:fsd_profile:ACoAAA8BYqEB…` for `williamhgates` |
-| Experience (titles, companies, dates, locations) | **Live** | 3 positions for `williamhgates`, 5 for `satyanadella`, verified correct |
-| Name, headline, about, location, images | **Fixture-verified**, blocked live | Maps correctly from a captured stream; see below |
-| Education, certifications | **Fixture-verified**, blocked live | 2 schools + 1 certification from a real capture |
-| Skills, languages | Mappers exist, unverified | No populated capture to calibrate against |
-| Offline fixture mode | **Live** | `OFFLINE_MODE=true` serves complete profiles, zero network |
-| Test suite | **230 passing**, no network | `pytest -q` |
+| 🟢 | Deployed publicly over HTTPS | https://linkedin-profile-api-green.vercel.app |
+| 🟢 | `GET /v1/health` | returns `{"status":"ok", ...}` |
+| 🟢 | OpenAPI docs at `/docs` | HTTP 200 |
+| 🟢 | Browser demo UI at `/` | HTTP 200 |
+| 🟢 | Accepts a LinkedIn profile URL | slug, trailing slash, locale prefix, query string |
+| 🟢 | Public GitHub repository | https://github.com/reyyanxahmed/linkedin-profile-api |
+| 🟢 | No credentials in the repo | `.env`, `.cookie_state.json`, HARs all gitignored |
+| 🟢 | Offline test suite | 233 tests, zero network |
+
+### Data extraction
+
+| | Section | State |
+|---|---|---|
+| 🟢 | Slug → profile URN | resolved live; falls back to position URNs when `dash` is quota-limited |
+| 🟢 | Experience — title, company, dates, location, employment type | verified live: 5 positions for `satyanadella`, 3 for `williamhgates` |
+| 🟢 | Education, certifications | verified against a captured profile (2 schools, 1 certification) |
+| 🟢 | Name, headline, location, about, profile images | verified against a captured profile stream |
+| 🟡 | Skills, languages | mappers implemented, no populated capture to calibrate against |
+
+### 🔴 What is blocked right now
+
+**The LinkedIn session cookies are expired.** This is the one thing standing between the
+deployment and live profile data, and it is a credential problem, not a code problem:
+
+```
+GET /voyager/api/me                    -> 401     (session expired)
+GET .../{slug}/positionGroups          -> 999     (account challenged)
+```
+
+Verified from two different IPs — the deployment and a local machine — so it is the
+session, not the host.
+
+**The fix is one command**, and it verifies before it deploys:
+
+```bash
+python scripts/update_session.py cookies.json     # or:  pbpaste | ... -
+```
+
+It writes `.env`, clears stale rotation state, spends exactly one request confirming
+the session authenticates, and only then pushes to the host and redeploys. If the
+cookies are already dead it stops and tells you which failure it is (401 = expired,
+999 = challenged) rather than shipping them.
+
+To get `cookies.json`: log in to LinkedIn, export cookies as a JSON array (devtools or
+a cookie-export extension), and keep the whole set — `lidc` and `bcookie` matter, see
+[Approach](#approach).
+
+### The deeper limitation, stated honestly
+
+Only experience currently comes from the live Voyager path. Everything else — name,
+headline, about, education, skills, certifications, languages — comes from the flagship
+RSC transport, which sits behind **web-app** auth. The cookies available to this project
+have consistently authenticated LinkedIn's API surface but not its web app:
+
+```
+GET /voyager/api/me                    -> 200, real data
+GET /feed/                             -> 302 -> /uas/login
+GET /in/{slug}   (HTML)                -> 999
+GET /flagship-web/in/{slug}/           -> 200, empty body
+```
+
+Those mappers are implemented and verified against real captured data, so **if you supply
+cookies from a session that can load `linkedin.com/feed/` in a browser, that path should
+light up with no code change.** Whether the split is an account-level restriction on the
+burner, IP reputation, or a deliberate API/web auth split is not established — it is the
+open question in this codebase, and it is documented rather than papered over with an
+empty section in the response.
 
 ### The one blocker, stated plainly
 
@@ -182,10 +250,12 @@ Then:
 
 ```bash
 curl http://localhost:8000/v1/health                       # unauthenticated
-curl -H "X-API-Key: $API_KEY" \
-  "http://localhost:8000/v1/profile?url=https://www.linkedin.com/in/satyanadella/"
+curl "http://localhost:8000/v1/profile?url=https://www.linkedin.com/in/satyanadella/"
 open http://localhost:8000/docs                            # OpenAPI / Swagger UI
 ```
+
+Add `-H "X-API-Key: $API_KEY"` if you set `API_KEY`; without it, set
+`ALLOW_UNAUTHENTICATED=true` or the API fails closed by design.
 
 ### Try it with no LinkedIn account at all
 
@@ -451,7 +521,7 @@ Invariants worth knowing before editing:
 ## Testing
 
 ```bash
-pytest -q          # 230 tests, no network access required
+pytest -q          # 233 tests, no network access required
 ruff check app tests
 ```
 
@@ -521,6 +591,20 @@ dropped rather than guessed at. On the calibration capture that costs one of sev
 positions (a sub-role whose title text is not adjacent to its date line). Emitting a
 description as a job title would be worse than omitting the row.
 
+### Keeping the session alive (the most likely thing to break)
+
+When the API starts returning `PROFILE_NOT_FOUND` for every slug, the session has
+expired or been challenged. Check it:
+
+```bash
+curl -s https://linkedin-profile-api-green.vercel.app/v1/health   # sessions.available
+python scripts/update_session.py cookies.json                     # refresh everywhere
+```
+
+The script verifies against LinkedIn before deploying, so it will not ship dead
+credentials. `401` means expired (log in again), `999` means challenged (open
+linkedin.com in a browser and clear the checkpoint first).
+
 ### Sessions get challenged, and `li_at` rotates
 
 Expect `999` and checkpoint challenges under load. The pool cools a session for
@@ -536,6 +620,15 @@ account alone.
 It returns real data for roughly the first couple of calls per window and then 401s. The
 profile URN is recovered from position URNs (`urn:li:fs_position:(<profileId>,…)`) when
 that happens, so URN resolution survives the quota.
+
+### Serverless has no shared session state
+
+The deployment is Vercel serverless. Rotated cookies are written to `/tmp`, which
+survives within a warm instance and is lost on a cold start; instances do not share it.
+For a credential that rotates, a long-running host (Fly, Render) with one persistent
+process is the better shape, or point `REDIS_URL` at a shared Redis so rotation state is
+common to all instances. The in-memory response cache is per-instance for the same
+reason.
 
 ### Datacenter IPs are flagged harder
 
